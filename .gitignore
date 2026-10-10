@@ -1,0 +1,18 @@
+# Telegram credentials and login: full account access, never commit
+.env
+*.session
+*.session-journal
+
+# personal data: the index (incl. -wal/-shm and .bak-* backups) and downloaded photos
+media.db*
+media/
+
+# not created by tgsearch (an HTTP cache that appeared in this folder)
+cache.sqlite
+
+# build output and tooling
+__pycache__/
+web/node_modules/
+web/dist/
+.playwright-mcp/
+.DS_Store

@@ -1,0 +1,208 @@
+# Tag vocabulary for "what the model sees" (zero-shot, from the picture embeddings). One label per line,
+# English works best; edit freely, then restart `serve`. Lines starting with # are ignored.
+# what kind of picture
+meme
+screenshot
+chat screenshot
+social media post
+tweet
+web page
+video game
+game screenshot
+anime
+cartoon
+comic
+drawing
+sketch
+painting
+digital art
+3d render
+poster
+advertisement
+logo
+chart
+diagram
+map
+spreadsheet
+program code
+terminal window
+math formulas
+handwritten notes
+printed text
+document
+receipt
+schedule
+calendar
+presentation slide
+qr code
+photo of a screen
+collage
+black and white photo
+old photo
+blurry photo
+selfie
+group photo
+portrait
+mirror selfie
+# people
+person
+man
+woman
+child
+baby
+crowd
+wedding
+party
+concert
+students
+soldier
+police
+# activities, sport
+sport
+gym
+boxing
+football
+basketball
+skiing
+swimming
+dancing
+cooking
+driving
+studying
+working at a computer
+# places
+beach
+sea
+mountains
+forest
+snow
+sunset
+night sky
+city street
+building
+house
+interior
+bedroom
+kitchen
+bathroom
+office
+classroom
+university
+shop
+supermarket
+restaurant
+cafe
+bar
+park
+river
+lake
+field
+village
+church
+museum
+airport
+train station
+road
+bridge
+countryside
+# transport
+car
+motorcycle
+bicycle
+bus
+train
+metro
+airplane
+ship
+# animals
+cat
+kitten
+dog
+puppy
+bird
+fish
+horse
+cow
+fox
+wolf
+bear
+hamster
+rabbit
+insect
+spider
+snake
+frog
+monkey
+# food and drink
+food
+pizza
+burger
+sushi
+cake
+dessert
+fruit
+vegetables
+meat
+soup
+breakfast
+fast food
+snacks
+chips
+coffee
+tea
+beer
+wine
+vodka
+energy drink
+# things
+phone
+laptop
+computer
+keyboard
+headphones
+camera
+book
+notebook
+money
+banknotes
+credit card
+ticket
+passport
+keys
+watch
+glasses
+shoes
+clothes
+dress
+hat
+bag
+toy
+flowers
+plant
+gift
+cigarette
+pills
+tools
+furniture
+sofa
+bed
+# mood, misc
+funny
+cute
+scary
+romantic
+blood
+weapon
+gun
+knife
+military
+fire
+explosion
+protest
+flag
+politics
+religion
+christmas
+birthday
+halloween
+sunset sky
