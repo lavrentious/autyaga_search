@@ -768,8 +768,8 @@ def main():
     s.add_argument("--msg", type=int, metavar="ID", help="message id (unique among private chats/small groups; "
                                                           "per chat in channels/supergroups, add --chat)")
     s.add_argument("--album", type=int, metavar="MSG_ID", help="all photos of the album that message belongs to")
-    s.add_argument("--sort", choices=ORDERS, default="new",
-                   help="new (default) / old: by message date; relevance: best match first")
+    s.add_argument("--sort", choices=ORDERS, help="new / old: by message date; relevance: best match first "
+                   "(default: relevance when searching text/--meaning/--similar, else new)")
     sub.add_parser("embed").add_argument("--model", default=MODEL, help=f"HF model id (default {MODEL})")
     sub.add_parser("dedup", help="merge copies of the same picture already indexed (copies' files go to the Trash)")
     sub.add_parser("serve").add_argument("--port", type=int, default=8000)
@@ -799,7 +799,8 @@ def main():
     else:
         db = connect()
         rows = search(db, a.text, a.caption, a.sender, a.chat, a.after, a.before, a.n,
-                      None if a.exact else a.min_score, a.model, a.similar, a.msg, a.sort,
+                      None if a.exact else a.min_score, a.model, a.similar, a.msg,
+                      a.sort or ("relevance" if a.text or a.ocr or a.caption or a.meaning or a.similar else "new"),
                       (None, a.album) if a.album else None, a.meaning, a.ocr)
         seen = appearances(db, [r[IMAGE] for r in rows])
         labels = tags(db, [r[IMAGE] for r in rows], a.model) if a.tags else {}

@@ -62,7 +62,7 @@ const EMPTY = {
   similar: "", // image id of a picture to find look-alikes of
   msg: "", // exact message id
   album: "", // "chat_id:msg_id": show that message's whole album
-  order: "new", // new / old: by message date; relevance: best match first
+  order: "", // new / old: by message date; relevance: best match first; "" = relevance when searching, else new
   page: 1,
 };
 const NO_IMAGE = // shown for messages whose photo is gone (e.g. expired self-destructing ones)
@@ -72,6 +72,7 @@ const NO_IMAGE = // shown for messages whose photo is gone (e.g. expired self-de
       '<text x="70" y="74" font-family="sans-serif" font-size="12" fill="#888" text-anchor="middle">no image</text></svg>',
   );
 type Filters = typeof EMPTY;
+const orderOf = (f: Filters) => f.order || (f.ocr || f.caption || f.meaning || f.similar ? "relevance" : "new");
 
 // filters <-> query string, non-defaults only: it's both the page URL (shareable, survives reload/back) and the API query
 const toQuery = (f: Filters) =>
@@ -285,7 +286,7 @@ function App() {
     }
     const ctl = new AbortController();
     setLoading(true);
-    fetch(`/api/search?${query}&limit=${PAGE}`, { signal: ctl.signal })
+    fetch(`/api/search?${toQuery({ ...debounced, order: orderOf(debounced) })}&limit=${PAGE}`, { signal: ctl.signal })
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error(r.statusText))))
       .then((r: { total: number; hits: Hit[] }) => {
         setHits(r.hits);
@@ -385,8 +386,8 @@ function App() {
               { value: "old", label: "Oldest" },
               { value: "relevance", label: "Best match" },
             ]}
-            value={filters.order}
-            onChange={(v) => set("order", v ?? "new")}
+            value={orderOf(filters)}
+            onChange={(v) => set("order", v ?? "")}
             title={filters.meaning || filters.similar ? "By date = the most similar pictures, ordered by date" : undefined}
           />
           <Checkbox size="xs" label="Exact" checked={filters.exact} onChange={(e) => set("exact", e.currentTarget.checked)} />

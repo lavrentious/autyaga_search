@@ -131,7 +131,8 @@ take `YYYY-MM-DD`; `-n` limit (default 20); `--open` opens hits in Preview. Each
   (best effort, no id-based link exists).
 - **Message ids**: private chats/basic groups share one per-account counter (an id is unique across them);
   channels/supergroups count per chat (combine `--msg` with `--chat`). Shown as "msg N" on every result.
-- **Sorting** (`order`/`--sort`): `new` (default) / `old` by message date — a picture sent several times
+- **Sorting** (`order`/`--sort`): default = `relevance` when a text/meaning/Similar query is given, else `new`
+  (date order put 80% fuzzy matches above an exact one). `new` / `old` by message date — a picture sent several times
   counts by its newest/oldest matching appearance; for Meaning/Similar (everything matches a little) it's the
   `limit` most similar, ordered by date; `relevance` = best match first. Ties broken by msg id.
 - **Albums**: Telegram sends a multi-photo post as several messages sharing `grouped_id`; table
@@ -195,6 +196,7 @@ take `YYYY-MM-DD`; `-n` limit (default 20); `--open` opens hits in Preview. Each
 - **2026-10-09**: Combinable search: separate Text and Meaning boxes (CLI `--meaning DESCRIPTION`), both + Similar
   together; Similar clears the boxes but combines with anything typed after. `fuzzy_rank` + `semantic_rank`
   merged into `rank()`.
+- **2026-10-10**: Default sort = best match when searching (Newest when just browsing); an explicit choice wins.
 - **2026-10-10**: Fixed: UI crashed when two indexed chats share a name (group → supergroup upgrade); chat
   filter now by id. Initial git commit.
 - **2026-10-09**: `sync` without names = refresh every chat already in the index (most recently active first;
