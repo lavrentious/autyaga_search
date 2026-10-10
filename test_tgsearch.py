@@ -35,6 +35,7 @@ assert paths(text='"борща"') == ["/c.jpg"]  # quotes in query don't break F
 assert paths(caption="глянь", sender="вася") == ["/a.jpg"]
 assert paths(chat="работа") == ["/b.jpg", "/a.jpg"]  # newest first
 assert paths(chat="работа", after="2024-04-01") == ["/b.jpg"]
+assert paths(chat_id=42) == ["/a.jpg", "/c.jpg"] and paths(chat_id=-1001234567890) == ["/b.jpg", "/a.jpg"]  # exact id
 assert paths(before="2024-04-01") == ["/a.jpg"]  # no text filter at all
 assert paths(text="пятниц", sender="вася") == []
 assert paths(text="пороль от wifi") == []  # typo: exact misses

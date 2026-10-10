@@ -163,7 +163,7 @@ def search(*args, **kw):
 
 def search_page(db, text=None, caption=None, sender=None, chat=None, after=None, before=None, limit=20,
                 min_score=None, model=MODEL, similar=None, msg_id=None, order="new", album=None, meaning=None, ocr=None,
-                offset=0):
+                offset=0, chat_id=None):
     """(rows `offset`..`offset + limit`, total pictures matching). One row per picture; every given criterion applies. Text queries decide what matches: `ocr` in the
     picture's text, `caption` in the message's, `text` in either; fuzzy (typos, OCR errors) if min_score is
     set, else exact substring. `meaning` (a description) and `similar` (an image id) score what's in the
@@ -192,6 +192,9 @@ def search_page(db, text=None, caption=None, sender=None, chat=None, after=None,
     if msg_id:
         where.append("msg_id = ?")
         params.append(msg_id)
+    if chat_id:  # exact chat; `chat` is a name substring (names repeat: a group upgraded to a supergroup gets a new id)
+        where.append("chat_id = ?")
+        params.append(chat_id)
     if album:
         where.append("""(chat_id, msg_id) IN (SELECT a.chat_id, a.msg_id FROM albums a JOIN albums b
             ON a.chat_id = b.chat_id AND a.grouped_id = b.grouped_id WHERE b.msg_id = ? AND (? IS NULL OR b.chat_id = ?))""")
@@ -697,13 +700,14 @@ def serve(port):
     def api_search(q: str = "", ocr: str = "", caption: str = "", sender: str = "", chat: str = "", after: str = "",
                    before: str = "", exact: bool = False, min_score: int = 80, limit: int = 60,
                    meaning: str = "", model: str = MODEL, similar: int = 0, msg: int = 0,
-                   order: Literal[ORDERS] = "new", album: str = "", page: int = 1):
+                   order: Literal[ORDERS] = "new", album: str = "", page: int = 1, chat_id: int = 0):
         db = connect()
         limit = min(limit, 1000)
         rows, total = search_page(db, q or None, caption or None, sender or None, chat or None, after or None,
                                   before or None, limit, None if exact else min_score, model, similar or None,
                                   msg or None, order, tuple(int(x) for x in album.split(":")) if album else None,
-                                  meaning or None, ocr or None, (max(page, 1) - 1) * limit)  # album: "chat_id:msg_id"
+                                  meaning or None, ocr or None, (max(page, 1) - 1) * limit,  # album: "chat_id:msg_id"
+                                  chat_id or None)
         seen = appearances(db, [r[IMAGE] for r in rows])
         sizes = album_sizes(db, [(r[7], r[8]) for r in rows])
         return {"total": total, "hits": [
@@ -724,8 +728,9 @@ def serve(port):
 
     @app.get("/api/chats")
     def api_chats():
-        rows = connect().execute("SELECT chat, count(*) FROM media GROUP BY chat_id ORDER BY 2 DESC")
-        return [{"name": name, "count": count} for name, count in rows]
+        # by id: names repeat (e.g. a basic group and the supergroup it was upgraded to); max(date) -> latest name
+        rows = connect().execute("SELECT chat_id, chat, max(date), count(*) FROM media GROUP BY chat_id ORDER BY 4 DESC")
+        return [{"id": cid, "name": name, "count": count} for cid, name, _, count in rows]
 
     if connect().execute("SELECT 1 FROM emb WHERE model = ? LIMIT 1", (MODEL,)).fetchone():  # warm up (~10 s)
         threading.Thread(target=lambda: tags(connect(), []), daemon=True).start()  # model + tag labels

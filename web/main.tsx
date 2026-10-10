@@ -44,12 +44,13 @@ type Hit = {
   ocr: string;
   caption: string;
 };
-type Chat = { name: string; count: number }; // also used for /api/models
+type Chat = { id: number; name: string; count: number };
+type Model = { name: string; count: number };
 
 const PAGE = 60;
 const EMPTY = {
   ocr: "", // text in the picture (OCR)
-  chat: "",
+  chat_id: "", // exact chat (names can repeat, e.g. a group and the supergroup it was upgraded to)
   sender: "",
   caption: "", // text in the message
   after: "",
@@ -237,7 +238,7 @@ function App() {
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(false);
   const [chats, setChats] = useState<Chat[]>([]);
-  const [models, setModels] = useState<Chat[]>([]);
+  const [models, setModels] = useState<Model[]>([]);
   const [similarTo, setSimilarTo] = useState<Hit | null>(null);
   const [tags, setTags] = useState<Record<number, string[]>>({});
   const pages = Math.ceil(total / PAGE);
@@ -342,9 +343,13 @@ function App() {
             placeholder="All chats"
             searchable
             clearable
-            data={chats.map((c) => ({ value: c.name, label: `${c.name} (${c.count})` }))}
-            value={filters.chat || null}
-            onChange={(v) => set("chat", v ?? "")}
+            data={chats.map((c) => ({
+              value: String(c.id),
+              // a repeated name gets its id, so the two are told apart
+              label: `${c.name} (${c.count})${chats.some((o) => o.name === c.name && o.id !== c.id) ? ` · ${c.id}` : ""}`,
+            }))}
+            value={filters.chat_id || null}
+            onChange={(v) => set("chat_id", v ?? "")}
           />
           <TextInput size="xs" placeholder="Sender" value={filters.sender} onChange={(e) => set("sender", e.currentTarget.value)} />
           <TextInput

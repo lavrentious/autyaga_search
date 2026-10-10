@@ -170,6 +170,10 @@ take `YYYY-MM-DD`; `-n` limit (default 20); `--open` opens hits in Preview. Each
 - Don't run two Telegram commands (`chats`/`sync`/`login`) at once: they share `tgsearch.session` (SQLite lock).
 - CLI commands that need the model (`--meaning`, `--similar`, `--tags`) load it each run (~10–20 s); `serve`
   keeps it loaded.
+- **Chat names aren't unique**: a basic group upgraded to a supergroup (Telegram does it when the group grows
+  or gets certain settings) leaves the old group deactivated (shown as deleted, old history) and continues under
+  a new `-100…` id, same name. The UI chat filter is by id (`chat_id`; duplicate names show their id); the CLI's
+  `--chat` stays a name substring (matches both). The old dropdown used names as values and crashed on the repeat.
 - Telethon sleeps on FloodWaits up to 60 s (now printed as "telethon: Sleeping for …").
 - **Sync hangs** (seen around 1,300 of 2k photos; Ctrl+C + rerun resumed fine): Telethon 1.45 has no request
   timeouts, and connections to other DCs (photos often live on a DC other than the account's) get no keepalive
@@ -191,6 +195,8 @@ take `YYYY-MM-DD`; `-n` limit (default 20); `--open` opens hits in Preview. Each
 - **2026-10-09**: Combinable search: separate Text and Meaning boxes (CLI `--meaning DESCRIPTION`), both + Similar
   together; Similar clears the boxes but combines with anything typed after. `fuzzy_rank` + `semantic_rank`
   merged into `rank()`.
+- **2026-10-10**: Fixed: UI crashed when two indexed chats share a name (group → supergroup upgrade); chat
+  filter now by id. Initial git commit.
 - **2026-10-09**: `sync` without names = refresh every chat already in the index (most recently active first;
   each resumes after its last indexed message, backfills album info; chats you left are reported as not found).
 - **2026-10-09**: Web UI pagination (total + pages instead of "Load more"; `search_page()` with `offset`) and
@@ -268,4 +274,4 @@ take `YYYY-MM-DD`; `-n` limit (default 20); `--open` opens hits in Preview. Each
 - VK (data archive export or API), local folders.
 - Web UI auth (login/password or token) — required before binding `serve` to anything but 127.0.0.1.
 - Web UI: lightbox instead of opening the image in a new tab, collapsible filters on phones,
-  per-chat filter by id instead of name substring, sync trigger/progress from the UI.
+  sync trigger/progress from the UI.
