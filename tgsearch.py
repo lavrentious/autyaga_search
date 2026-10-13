@@ -1,19 +1,20 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = ["telethon", "ocrmac", "qrcode", "iterfzf", "rapidfuzz", "fastapi", "uvicorn",
-#                 "torch", "transformers>=5", "numpy", "pillow", "imagehash"]
+#                 "torch", "transformers>=5", "numpy", "pillow", "imagehash", "tqdm"]
 # ///
-"""Index photos from selected Telegram chats (OCR via Apple Vision) and search them.
+"""Index photos (and images sent as files) from selected Telegram chats (OCR via Apple Vision) and search them.
 
   export TG_API_ID=... TG_API_HASH=...   # from https://my.telegram.org -> API development tools
   uv run tgsearch.py login                 # QR login, once (login codes often never arrive for API apps)
   uv run tgsearch.py chats                 # pick chats in fzf (multi-select), then sync them
-  uv run tgsearch.py sync <id|name>...     # download + OCR new photos (resumable)
+  uv run tgsearch.py sync <id|name>...     # download + OCR new photos/image files (resumable)
   uv run tgsearch.py sync                  # same for every chat already indexed
   uv run tgsearch.py search "пароль" --from Вася --after 2024-01-01 --open
   uv run tgsearch.py search --meaning "собака в снегу"   # by what's in the picture (embeddings)
   uv run tgsearch.py embed [--model HF_ID]   # vectors for downloaded photos still missing them (sync does this too)
   uv run tgsearch.py dedup                 # merge copies of the same picture already indexed (sync does this for new ones)
+  uv run tgsearch.py repair [<id|name>...] # mark messages deleted in Telegram, update captions, re-download lost files
   uv run tgsearch.py serve                 # web UI on http://127.0.0.1:8000 (build it first: cd web && bun run build)
 """
 import argparse
@@ -54,13 +55,16 @@ def link(chat_id, msg_id):
     return f"tg://openmessage?chat_id={-chat_id}&message_id={msg_id}"
 
 
+# is this media row's message gone from Telegram (as of the last `repair`)?
+DELETED = "EXISTS (SELECT 1 FROM deleted d WHERE d.chat_id = media.chat_id AND d.msg_id = media.msg_id)"
 # search rows: these, then a snippet
-COLS = "date, chat, sender, path, tglink(chat_id, msg_id), ocr, caption, chat_id, msg_id, image"
+COLS = "date, chat, sender, path, tglink(chat_id, msg_id), ocr, caption, chat_id, msg_id, image, " + DELETED
 IMAGE = 9  # index of `image` in a search row
 COL_OF = {"ocr": 5, "caption": 6}  # ...and of the searchable texts
 
 # A picture is stored, OCR'd and embedded once (`images`, `emb`); every message it was sent in is a `media` row
 # (an appearance) pointing at it, carrying a copy of its OCR text so FTS can search appearances directly.
+# images.photo_id is Telegram's photo or document id (an image sent as a file): both random 64-bit, no clashes.
 SCHEMA = [
     "CREATE TABLE IF NOT EXISTS images (id INTEGER PRIMARY KEY, path TEXT, phash TEXT, photo_id INTEGER UNIQUE)",
     """CREATE VIRTUAL TABLE IF NOT EXISTS media USING fts5(ocr, caption, sender, chat,
@@ -70,6 +74,11 @@ SCHEMA = [
     """CREATE TABLE IF NOT EXISTS albums (chat_id INTEGER, msg_id INTEGER, grouped_id INTEGER,
         PRIMARY KEY (chat_id, msg_id)) WITHOUT ROWID""",
     "CREATE INDEX IF NOT EXISTS albums_group ON albums (chat_id, grouped_id)",
+    # Chats whose image files older than their newest indexed message were looked for: sync used to fetch
+    # photos only, and its resume point (newest indexed message) would never reach back to those files.
+    "CREATE TABLE IF NOT EXISTS files_scanned (chat_id INTEGER PRIMARY KEY)",
+    # messages `repair` found deleted in Telegram; their rows (and files) stay searchable
+    "CREATE TABLE IF NOT EXISTS deleted (chat_id INTEGER, msg_id INTEGER, PRIMARY KEY (chat_id, msg_id)) WITHOUT ROWID",
 ]
 
 
@@ -134,10 +143,10 @@ def first_per_image(items, image_of, limit=None):
 
 
 def appearances(db, images):
-    """image -> [(date, chat, sender, link, msg_id)], oldest first: every message a picture was sent in."""
+    """image -> [(date, chat, sender, link, msg_id, deleted)], oldest first: every message a picture was sent in."""
     out = {}
     # ponytail: `image` is UNINDEXED, so this scans all appearances (ms for 10k); index table if it grows a lot
-    q = f"SELECT image, date, chat, sender, tglink(chat_id, msg_id), msg_id FROM media WHERE image IN ({','.join('?' * len(images))})"
+    q = f"SELECT image, date, chat, sender, tglink(chat_id, msg_id), msg_id, {DELETED} FROM media WHERE image IN ({','.join('?' * len(images))})"
     for img, *rest in db.execute(q + " ORDER BY date", list(images)):
         out.setdefault(img, []).append(tuple(rest))
     return out
@@ -328,13 +337,13 @@ def tags(db, images, model=MODEL, k=4):
 
 
 def embed(db, name=MODEL, batch=32):
-    from PIL import Image
+    from tqdm import tqdm
 
     skipped = []
 
     def load(path):
         try:
-            return Image.open(path).convert("RGB")
+            return open_image(path).convert("RGB")
         except OSError:  # missing/corrupt file: skip it, don't block the rest
             skipped.append(path)
 
@@ -345,26 +354,39 @@ def embed(db, name=MODEL, batch=32):
     print(f"== embedding {len(rows)} photos with {name}")
     t0 = time.time()
     try:
-        for i in range(0, len(rows), batch):
-            chunk = [(image, img) for image, p in rows[i:i + batch] if (img := load(p))]
-            if chunk:
-                vecs = encode(name, images=[img for _, img in chunk])
-                with db:  # committed per batch: Ctrl+C or a crash loses at most one batch
-                    db.executemany("INSERT INTO emb VALUES (?,?,?)",
-                                   [(name, image, v.tobytes()) for (image, _), v in zip(chunk, vecs)])
-            print(f"  [{min(i + batch, len(rows))}/{len(rows)}]", end="\r", flush=True)
+        with tqdm(total=len(rows), unit="pic") as bar:
+            for i in range(0, len(rows), batch):
+                chunk = [(image, img) for image, p in rows[i:i + batch] if (img := load(p))]
+                if chunk:
+                    vecs = encode(name, images=[img for _, img in chunk])
+                    with db:  # committed per batch: Ctrl+C or a crash loses at most one batch
+                        db.executemany("INSERT INTO emb VALUES (?,?,?)",
+                                       [(name, image, v.tobytes()) for (image, _), v in zip(chunk, vecs)])
+                bar.update(len(rows[i:i + batch]))
     except KeyboardInterrupt:
-        return print("\nstopped, run embed again to resume")
-    print(f"\n  done in {time.time() - t0:.0f}s" + (f", {len(skipped)} unreadable skipped" if skipped else ""))
+        return print("stopped, run embed again to resume")
+    print(f"  done in {time.time() - t0:.0f}s" + (f", {len(skipped)} unreadable skipped" if skipped else ""))
+
+
+def open_image(path):
+    """Image.open, with Pillow's decompression-bomb limit (~179M pixels) raised for huge scans/panoramas sent as
+    files. Files claiming even more raise OSError, which callers treat as unreadable: a crafted few-KB PNG can
+    claim billions of pixels, and decoding it would eat all memory on every sync retry."""
+    from PIL import Image
+
+    Image.MAX_IMAGE_PIXELS = 500_000_000  # Pillow refuses 2x this: 1G pixels, ~3 GB decoded as RGB
+    try:
+        return Image.open(path)
+    except Image.DecompressionBombError as e:
+        raise OSError(e) from e
 
 
 def phash(path):
     """64-bit perceptual hash as int; None if the file can't be read."""
     import imagehash
-    from PIL import Image
 
     try:
-        return int(str(imagehash.phash(Image.open(path))), 16)
+        return int(str(imagehash.phash(open_image(path))), 16)
     except OSError:
         return None
 
@@ -400,7 +422,7 @@ def same_picture(a, b, ocr_a, ocr_b):
     if text_conflict(ocr_a, ocr_b):
         return False
     try:
-        px = [np.asarray(Image.open(p).convert("L").resize((160, 160), Image.BILINEAR), np.int16) for p in (a, b)]
+        px = [np.asarray(open_image(p).convert("L").resize((160, 160), Image.BILINEAR), np.int16) for p in (a, b)]
     except OSError:
         return False
     diff = (np.abs(px[0] - px[1]) > 40).mean()
@@ -431,7 +453,6 @@ def dedup(db):
     """Merge copies of the same picture already indexed: one file and vector per picture; every appearance
     kept, with its own caption and OCR text. The copies' files go to the Trash."""
     import numpy as np
-    from PIL import Image
 
     todo = db.execute("SELECT id, path FROM images WHERE phash IS NULL").fetchall()
     if todo:
@@ -463,7 +484,7 @@ def dedup(db):
 
     def area(path):
         try:
-            w, h = Image.open(path).size
+            w, h = open_image(path).size
             return w * h
         except OSError:
             return 0
@@ -562,10 +583,12 @@ def analyze(path):
 
 def ocr(path):
     from ocrmac import ocrmac
+    from tqdm import tqdm
+
     try:
         return " ".join(t for t, *_ in ocrmac.OCR(str(path), language_preference=LANGS).recognize())
     except Exception as e:  # one broken image must not block resume forever
-        print(f"  OCR failed on {path}: {e}")
+        tqdm.write(f"  OCR failed on {path}: {e}")
         return ""
 
 
@@ -587,13 +610,31 @@ def sync(tg, db, dialogs):
     embed(db)  # vectors for search by meaning, for whatever isn't embedded yet
 
 
+async def merge(a, b):
+    """Two async iterables of messages, each in ascending id order, as one in ascending id order."""
+    a, b = aiter(a), aiter(b)  # Telethon's iterators set up their state in __aiter__
+    x, y = await anext(a, None), await anext(b, None)
+    while x is not None or y is not None:
+        if y is None or (x is not None and x.id < y.id):
+            yield x
+            x = await anext(a, None)
+        else:
+            yield y
+            y = await anext(b, None)
+
+
 async def sync_chat(tg, db, d):
-    from telethon.tl.types import InputMessagesFilterPhotos as Photos
+    from telethon.tl.types import InputMessagesFilterDocument as Files, InputMessagesFilterPhotos as Photos
     from telethon.utils import get_display_name
+    from tqdm import tqdm
 
     last, have = db.execute("SELECT max(msg_id), count(*) FROM media WHERE chat_id = ?", (d.id,)).fetchone()
-    todo = (await tg.get_messages(d, limit=0, filter=Photos)).total - have
-    print(f"== {d.name} ({d.id}): ~{todo} new photos")
+    scanned = db.execute("SELECT 1 FROM files_scanned WHERE chat_id = ?", (d.id,)).fetchone()
+    done = {m for (m,) in db.execute("SELECT msg_id FROM media WHERE chat_id = ?", (d.id,))}
+    # Telegram can't filter by mime: counts every file, shrunk as non-images turn up. ponytail: ones older than
+    # the resume point never turn up, so on short re-syncs the bar starts too long and snaps to 100% at the end.
+    todo = sum([(await tg.get_messages(d, limit=0, filter=f)).total for f in (Photos, Files)]) - have
+    print(f"== {d.name} ({d.id})")
     # album ids for photos indexed before albums were tracked (100 messages per request, no downloads)
     unchecked = [m for (m,) in db.execute("""SELECT msg_id FROM media WHERE chat_id = ? AND NOT EXISTS
         (SELECT 1 FROM albums a WHERE a.chat_id = media.chat_id AND a.msg_id = media.msg_id)""", (d.id,))]
@@ -608,20 +649,23 @@ async def sync_chat(tg, db, d):
         print()
     loop, pool = asyncio.get_running_loop(), ThreadPoolExecutor(OCR_THREADS)
     window, n, copies, t0 = deque(), 0, 0, time.time()
+    bar = tqdm(total=todo, desc=d.name, unit="pic")  # log lines go through tqdm.write, above the bar
     pics = pictures(db)
     by_photo = dict(db.execute("SELECT photo_id, id FROM images WHERE photo_id IS NOT NULL"))
     in_flight = set()  # photo ids being downloaded right now (an original and its forward in one window)
     stage = {}  # msg id -> what its photo is waiting on, to report a stall
 
     async def fetch(m):
-        pid = m.photo.id if m.photo else None
-        if pid and (pid in by_photo or pid in in_flight):  # forward/re-send of a photo we have: no download
+        if not m.file:  # e.g. expired self-destructing photo: nothing to save
+            return None
+        pid = m.file.media.id
+        if pid in by_photo or pid in in_flight:  # forward/re-send of a picture we have: no download
             return m, None, None, None
         in_flight.add(pid)
-        path = HERE / "media" / str(d.id) / f"{m.id}.jpg"
+        path = HERE / "media" / str(d.id) / f"{m.id}{m.file.ext or ''}"
         path.parent.mkdir(parents=True, exist_ok=True)
         stage[m.id] = "download"
-        if not await tg.download_media(m, file=str(path)):  # e.g. expired self-destructing photo: nothing to save
+        if not await tg.download_media(m, file=str(path)):
             return None
         stage[m.id] = "OCR"
         return m, path, *await loop.run_in_executor(pool, analyze, path)
@@ -631,7 +675,7 @@ async def sync_chat(tg, db, d):
         if res is None:
             return
         m, path, text, h = res
-        pid = m.photo.id if m.photo else None
+        pid = m.file.media.id
         image = by_photo.get(pid) or (h is not None and find_copy(pics, path, text, h)) or None
         if not image and not path:  # forward of a photo whose own download failed (expired): nothing to keep
             return
@@ -653,7 +697,7 @@ async def sync_chat(tg, db, d):
         add(db, d.id, d.name, m.id, date, get_display_name(m.sender), m.message, text, path, image)
         with db:
             db.execute("INSERT OR REPLACE INTO albums VALUES (?,?,?)", (d.id, m.id, m.grouped_id))
-        print(f"  [{n}/{todo}] {date} #{m.id} {'(copy) ' if is_copy else ''}{text[:60]!r}")
+        tqdm.write(f"  {date} #{m.id} {'(copy) ' if is_copy else ''}{text[:60]!r}")
 
     # Up to DOWNLOADS photos in flight (downloading or in OCR), but rows are saved in message order,
     # so max(msg_id) stays a valid resume point after Ctrl+C, a crash or a stall.
@@ -664,18 +708,30 @@ async def sync_chat(tg, db, d):
             async def advance():
                 save(await window[0][1])
                 window.popleft()
+                bar.update()
                 deadline.reschedule(loop.time() + STALL)
 
-            # ponytail: compressed photos only; images sent as files/videos skipped, add a doc filter when needed
-            async for m in tg.iter_messages(d, filter=Photos, min_id=last or 0, reverse=True):
+            async def image_files():  # until this chat is `scanned`, also those older than the resume point
+                async for m in tg.iter_messages(d, filter=Files, min_id=scanned and last or 0, reverse=True):
+                    if m.id in done:
+                        continue
+                    if m.document and m.document.mime_type.startswith("image/") and not m.sticker:
+                        yield m
+                    else:  # not a picture, but counted in the bar's total
+                        bar.total -= 1
+
+            # ponytail: videos, GIFs and stickers skipped (see README backlog)
+            photos = tg.iter_messages(d, filter=Photos, min_id=last or 0, reverse=True)
+            async for m in merge(photos, image_files()):
                 window.append((m.id, asyncio.ensure_future(fetch(m))))
                 if len(window) == DOWNLOADS:
                     await advance()
             while window:
                 await advance()
+            bar.total = bar.n
     except TimeoutError:
         mid = window[0][0] if window and window[0][1].cancelled() else None  # cancelled = the one awaited
-        print(f"  no progress for {STALL}s, stuck on " +
+        tqdm.write(f"  no progress for {STALL}s, stuck on " +
               (f"msg #{mid} ({stage.get(mid, 'queued')})" if mid else "fetching the message list"))
         raise
     finally:
@@ -683,8 +739,65 @@ async def sync_chat(tg, db, d):
             t.cancel()
         await asyncio.gather(*(t for _, t in window), return_exceptions=True)
         pool.shutdown(cancel_futures=True)
+        bar.close()
+    with db:
+        db.execute("INSERT OR IGNORE INTO files_scanned VALUES (?)", (d.id,))
     print(f"  done: {n} photos ({copies} copies of pictures already indexed) in {time.time() - t0:.0f}s "
           f"({n / max(time.time() - t0, 1e-9):.1f}/s)")
+
+
+def repair(tg, db, dialogs):
+    """Bring the index in line with Telegram: messages deleted there get marked (rows and files stay), edited
+    captions and renamed chats get updated, and pictures whose file is missing are downloaded again."""
+    from tqdm import tqdm
+
+    missing = {i: p for i, p in db.execute("SELECT id, path FROM images") if not os.path.exists(p)}
+    # paths are absolute: if the folder was moved, don't download everything into the old location
+    moved = [missing.pop(i) for i, p in list(missing.items()) if not Path(p).is_relative_to(HERE)]
+    sent_in = {}  # missing picture -> every message it was sent in
+    for img, cid, mid in db.execute("SELECT image, chat_id, msg_id FROM media"):
+        if img in missing:
+            sent_in.setdefault(img, []).append((cid, mid))
+    wanted = {k for ks in sent_in.values() for k in ks}
+    alive = {}  # of those messages, the ones still in Telegram
+    try:
+        for d in dialogs:
+            with db:
+                db.execute("UPDATE media SET chat = ? WHERE chat_id = ? AND chat != ?", (norm(d.name), d.id, norm(d.name)))
+            rows = db.execute(f"SELECT rowid, msg_id, caption FROM media WHERE chat_id = ? AND NOT {DELETED}",
+                              (d.id,)).fetchall()
+            gone = edited = 0
+            with tqdm(total=len(rows), desc=d.name, unit="msg") as bar:
+                for i in range(0, len(rows), 100):
+                    batch = rows[i:i + 100]
+                    msgs = tg.get_messages(d, ids=[mid for _, mid, _ in batch])  # None for deleted messages
+                    with db:
+                        for (rowid, mid, caption), m in zip(batch, msgs):
+                            if m is None:
+                                db.execute("INSERT OR IGNORE INTO deleted VALUES (?,?)", (d.id, mid))
+                                gone += 1
+                                continue
+                            if norm(m.message) != caption:
+                                db.execute("UPDATE media SET caption = ? WHERE rowid = ?", (norm(m.message), rowid))
+                                edited += 1
+                            if (d.id, mid) in wanted:
+                                alive[d.id, mid] = m
+                    bar.update(len(batch))
+            print(f"  {gone} deleted in Telegram, {edited} captions edited")
+        restored = 0
+        for img, path in tqdm(missing.items(), desc="missing files", unit="file"):
+            # its own message first: other appearances may be smaller copies (dedup keeps the biggest)
+            for k in sorted(sent_in[img], key=lambda k: Path(path).with_suffix("").parts[-2:] != tuple(map(str, k))):
+                Path(path).parent.mkdir(parents=True, exist_ok=True)
+                if k in alive and tg.download_media(alive[k], file=path):
+                    restored += 1
+                    break
+    except KeyboardInterrupt:
+        return print("\nstopped, run repair again (it checks everything anew)")
+    print(f"  {restored} of {len(missing)} missing files downloaded again" +
+          (f", the rest are gone from Telegram (or from the chats checked)" if restored < len(missing) else "") +
+          (f"; {len(moved)} skipped: their paths point outside {HERE} (folder moved?)" if moved else ""))
+    embed(db)  # restored files that never got a vector
 
 
 def serve(port):
@@ -712,10 +825,11 @@ def serve(port):
         sizes = album_sizes(db, [(r[7], r[8]) for r in rows])
         return {"total": total, "hits": [
             {"image_id": img, "msg_id": mid, "chat_id": cid, "album": sizes.get((cid, mid), 0), "date": date, "chat": chat,
-             "sender": sender, "link": url, "snippet": snip, "ocr": ocr, "caption": cap,
+             "sender": sender, "link": url, "snippet": snip, "ocr": ocr, "caption": cap, "deleted": bool(gone),
              "image": "/media/" + Path(path).relative_to(HERE / "media").as_posix(),
-             "appearances": [dict(zip(("date", "chat", "sender", "link", "msg_id"), a)) for a in seen[img]]}
-            for date, chat, sender, path, url, ocr, cap, cid, mid, img, snip in rows]}
+             "appearances": [dict(zip(("date", "chat", "sender", "link", "msg_id"), a), deleted=bool(a[5]))
+                             for a in seen[img]]}
+            for date, chat, sender, path, url, ocr, cap, cid, mid, img, gone, snip in rows]}
 
     @app.get("/api/tags")
     def api_tags(images: str, model: str = MODEL):  # separate call so text search never waits for the model
@@ -743,7 +857,7 @@ def serve(port):
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd")
-    sub.add_parser("help").add_argument("topic", nargs="?", choices=["login", "chats", "sync", "search", "embed", "dedup", "serve"])
+    sub.add_parser("help").add_argument("topic", nargs="?", choices=["login", "chats", "sync", "search", "embed", "dedup", "repair", "serve"])
     sub.add_parser("login")
     sub.add_parser("chats")
     sub.add_parser("sync").add_argument("chat", nargs="*", help="dialog id or exact name; none = every chat "
@@ -772,6 +886,9 @@ def main():
                    "(default: relevance when searching text/--meaning/--similar, else new)")
     sub.add_parser("embed").add_argument("--model", default=MODEL, help=f"HF model id (default {MODEL})")
     sub.add_parser("dedup", help="merge copies of the same picture already indexed (copies' files go to the Trash)")
+    sub.add_parser("repair", help="mark messages deleted in Telegram (rows stay), update edited captions and chat "
+                   "names, re-download files missing on disk").add_argument(
+        "chat", nargs="*", help="dialog id or exact name; none = every chat already indexed")
     sub.add_parser("serve").add_argument("--port", type=int, default=8000)
     a = p.parse_args()
 
@@ -789,13 +906,13 @@ def main():
         db = connect()
         with client() as tg:
             sync(tg, db, pick(tg, db))
-    elif a.cmd == "sync":
+    elif a.cmd in ("sync", "repair"):
         db = connect()
         targets = a.chat or [str(c) for (c,) in db.execute("SELECT DISTINCT chat_id FROM media")]
         if not targets:
             return print("nothing indexed yet: name the chats to sync, or pick them with `chats`")
         with client() as tg:
-            sync(tg, db, find(tg, targets))
+            (sync if a.cmd == "sync" else repair)(tg, db, find(tg, targets))
     else:
         db = connect()
         rows = search(db, a.text, a.caption, a.sender, a.chat, a.after, a.before, a.n,
@@ -805,13 +922,14 @@ def main():
         seen = appearances(db, [r[IMAGE] for r in rows])
         labels = tags(db, [r[IMAGE] for r in rows], a.model) if a.tags else {}
         sizes = album_sizes(db, [(r[7], r[8]) for r in rows])
-        for date, chat, sender, path, url, *_, cid, mid, img, snip in rows:
+        for date, chat, sender, path, url, *_, cid, mid, img, gone, snip in rows:
             in_album = f"  (album of {sizes[cid, mid]}: --album {mid})" if (cid, mid) in sizes else ""
-            print(f"#{img}  {date}  {chat} / {sender}  msg {mid}{in_album}\n  {path}\n  {url}\n  {snip}")
+            print(f"#{img}  {date}  {chat} / {sender}  msg {mid}{' (deleted in Telegram)' * gone}{in_album}\n"
+                  f"  {path}\n  {url}\n  {snip}")
             if img in labels:
                 print("  tags: " + ", ".join(labels[img]))
             if len(seen[img]) > 1:
-                print("  sent " + ", ".join(f"{d} in {c} by {s} (msg {m})" for d, c, s, _, m in seen[img]))
+                print("  sent " + ", ".join(f"{d} in {c} by {s} (msg {m}{', deleted' * g})" for d, c, s, _, m, g in seen[img]))
             print()
         if a.open and rows:
             subprocess.run(["open", *(r[3] for r in rows)])

@@ -1,10 +1,14 @@
 # /// script
-# dependencies = ["rapidfuzz", "numpy", "pillow", "imagehash"]
+# dependencies = ["rapidfuzz", "numpy", "pillow", "imagehash", "tqdm"]
 # ///
 """uv run test_tgsearch.py — checks indexing/search/dedup logic (no Telegram, no OCR, no model)."""
+import asyncio
 import sqlite3
+import struct
 import tempfile
+import zlib
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 from PIL import Image, ImageDraw
@@ -71,9 +75,12 @@ assert search(db, text="встреча")[0][4] == "https://t.me/c/1234567890/2" 
 assert search(db, text="борщ", min_score=80)[0][4] == "tg://user?id=42"  # private chat: no message links, open chat
 assert link(-555, 9) == "tg://openmessage?chat_id=555&message_id=9"  # basic group: best effort
 assert appearances(db, [1, 2]) == {
-    1: [("2024-03-01 10:00", "Работа", "Вася Пупкин", "https://t.me/c/1234567890/1", 1),
-        ("2025-08-01 10:00", "Мама", "Мама", "tg://user?id=42", 10)],
-    2: [("2024-06-01 10:00", "Работа", "Петя", "https://t.me/c/1234567890/2", 2)]}
+    1: [("2024-03-01 10:00", "Работа", "Вася Пупкин", "https://t.me/c/1234567890/1", 1, 0),
+        ("2025-08-01 10:00", "Мама", "Мама", "tg://user?id=42", 10, 0)],
+    2: [("2024-06-01 10:00", "Работа", "Петя", "https://t.me/c/1234567890/2", 2, 0)]}
+db.execute("INSERT INTO deleted VALUES (42, 10)")  # `repair` found msg 10 deleted in Telegram: still found, flagged
+assert appearances(db, [1])[1][1][-1] == 1 and search(db, msg_id=10)[0][-2] == 1 and search(db, msg_id=1)[0][-2] == 0
+db.execute("DELETE FROM deleted")
 
 # message id lookup: picks that appearance (and shows the picture through it)
 assert paths(msg_id=10) == ["/a.jpg"] and search(db, msg_id=10)[0][1] == "Мама"
@@ -158,6 +165,11 @@ with tempfile.TemporaryDirectory() as d:
     meme("SOME CAPTION HERE").resize((300, 225)).save(f"{d}/m_copy.jpg", quality=70)
     meme("OTHER WORDS THERE").save(f"{d}/m_other.png")
     assert (phash(f"{d}/m.png") ^ phash(f"{d}/m_copy.jpg")).bit_count() <= tgsearch.DUP_HASH_BITS
+    # a PNG whose header claims 2.5G pixels: unreadable (no fingerprint), not a crash, nothing decoded
+    chunk = lambda kind, data: struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+    Path(f"{d}/bomb.png").write_bytes(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 50000, 50000,
+                                      8, 2, 0, 0, 0)) + chunk(b"IEND", b""))
+    assert phash(f"{d}/bomb.png") is None
     assert same_picture(f"{d}/m.png", f"{d}/m_copy.jpg", "", "")
     assert not same_picture(f"{d}/m.png", f"{d}/m_other.png", "SOME CAPTION HERE", "OTHER WORDS THERE")
     assert not same_picture(f"{d}/m.png", f"{d}/nope.png", "", "")  # unreadable: never merge
@@ -209,4 +221,15 @@ with tempfile.TemporaryDirectory() as d:
     assert new.execute("SELECT * FROM emb").fetchall() == [("m", 2, b"\x01")]
     assert Path(f"{d}/old.db.bak-pre-dedup").exists()
     assert [r[3] for r in search(new, text="текст")] == ["/x.jpg"]
+
+# sync: photos and images sent as files come as two streams, merged back into message order (= resume order)
+async def msgs(*ids):
+    for i in ids:
+        yield SimpleNamespace(id=i)
+
+
+async def merged(a, b):
+    return [m.id async for m in tgsearch.merge(msgs(*a), msgs(*b))]
+assert asyncio.run(merged([1, 4, 5], [2, 3, 6, 7])) == [1, 2, 3, 4, 5, 6, 7]
+assert asyncio.run(merged([], [2])) == [2] and asyncio.run(merged([1], [])) == [1] and asyncio.run(merged([], [])) == []
 print("ok")

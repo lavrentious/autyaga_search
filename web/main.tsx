@@ -105,6 +105,22 @@ function copyText(text: string) {
   return ok ? Promise.resolve() : Promise.reject();
 }
 
+// images, unlike text, have no fallback: ClipboardItem exists only on https/localhost pages, so no button elsewhere
+const canCopyImage = typeof ClipboardItem !== "undefined";
+// clipboards reliably take only PNG, and photos are JPEG: re-encode. The item gets a promise, not a blob, so the
+// write starts inside the click (Safari refuses one made after an await)
+function copyImage(url: string) {
+  const png = fetch(url)
+    .then((r) => r.blob())
+    .then(createImageBitmap)
+    .then((img) => {
+      const canvas = Object.assign(document.createElement("canvas"), { width: img.width, height: img.height });
+      canvas.getContext("2d")!.drawImage(img, 0, 0);
+      return new Promise<Blob>((ok, no) => canvas.toBlob((b) => (b ? ok(b) : no()), "image/png"));
+    });
+  return navigator.clipboard.write([new ClipboardItem({ "image/png": png })]);
+}
+
 function Result({
   hit,
   ocrQuery,
@@ -125,9 +141,9 @@ function Result({
   // search snippets mark matches with the CLI's ANSI bold codes: split on them, odd parts are matches
   const parts = hit.snippet.split(/\x1b\[[01]m/);
   const matched = parts.length > 1;
-  const copy = () =>
-    copyText(hit.link).then(
-      () => notifications.show({ color: "green", message: "Link copied" }),
+  const copy = (what: string, done: Promise<unknown>) =>
+    done.then(
+      () => notifications.show({ color: "green", message: `${what} copied` }),
       () => fail("Couldn't copy"),
     );
 
@@ -213,9 +229,14 @@ function Result({
               Open chat
             </Button>
           )}
-          <Button size="compact-sm" variant="subtle" onClick={copy}>
+          <Button size="compact-sm" variant="subtle" onClick={() => copy("Link", copyText(hit.link))}>
             Copy link
           </Button>
+          {canCopyImage && (
+            <Button size="compact-sm" variant="subtle" onClick={() => copy("Image", copyImage(hit.image))}>
+              Copy image
+            </Button>
+          )}
           {onSimilar && (
             <Button size="compact-sm" variant="subtle" onClick={onSimilar}>
               Similar

@@ -47,7 +47,7 @@ take `YYYY-MM-DD`; `-n` limit (default 20); `--open` opens hits in Preview. Each
 | `web/dist/` | built frontend, served by `serve` (rebuild: `cd web && bun run build`) |
 | `media.db` (+ `-wal`, `-shm`) | WAL-mode SQLite: keep the three together, never copy `media.db` alone. The index: `images` (one per picture), `media` (FTS5, one row per appearance), `emb` |
 | `media.db.bak-pre-dedup`, `.bak-pre-repair` | backups from the 2026-10-08 dedup migration; delete when happy |
-| `media/<chat_id>/<msg_id>.jpg` | downloaded photos (kept: re-OCR/viewing without re-downloading) |
+| `media/<chat_id>/<msg_id>.<ext>` | downloaded photos and image files (kept: re-OCR/viewing without re-downloading) |
 | `tgsearch.session` | **Telethon login = full account access. Never share/commit.** |
 | `.env` | API id/hash. **Secret.** Template: `.env.example` |
 | `.gitignore` | keeps secrets (`.env`, `*.session`) and personal data (`media.db*`, `media/`) out of git |
@@ -55,11 +55,14 @@ take `YYYY-MM-DD`; `-n` limit (default 20); `--open` opens hits in Preview. Each
 ## How it works
 
 - **Ingest** (`sync`): `iter_messages(filter=Photos, min_id=<max indexed msg_id>, reverse=True)` → oldest
-  first. Pipeline: up to `DOWNLOADS`=8 photos in flight (each: async download → OCR in a 4-thread pool), but
-  rows are saved strictly in message order (sliding window, await the head), so the max indexed id is always
-  a valid resume point. Ctrl+C cancels in-flight work cleanly; rerun resumes (half-downloaded files are just
-  overwritten). Prints `[n/total]` per photo and a final rate. Telethon runs in sync mode; the pipeline is
-  one coroutine per chat run via `tg.loop.run_until_complete`.
+  first, merged in message order with `filter=Document` messages whose mime is `image/*` (images sent as files;
+  stickers skipped). Chats synced before files were fetched (not in `files_scanned`) get their older image files
+  backfilled once (the files stream starts at 0, already indexed messages are skipped). Pipeline: up to
+  `DOWNLOADS`=8 photos in flight (each: async download → OCR in a 4-thread pool), but rows are saved strictly
+  in message order (sliding window, await the head), so the max indexed id is always a valid resume point.
+  Ctrl+C cancels in-flight work cleanly; rerun resumes (half-downloaded files are just overwritten). A tqdm bar
+  per chat (count, rate, ETA) with one log line per picture above it. Telethon runs in sync mode; the pipeline
+  is one coroutine per chat run via `tg.loop.run_until_complete`.
 - **Chat selection**: `chats` streams `iter_dialogs()` into fzf (via `iterfzf`, which bundles the fzf binary),
   so the list appears while pages still load and picking early stops further fetching. Already-indexed chats
   show `✓ N indexed`. `sync` resolves ids/exact names and stops iterating dialogs once all are found.
@@ -234,13 +237,12 @@ take `YYYY-MM-DD`; `-n` limit (default 20); `--open` opens hits in Preview. Each
 
 **Performance**
 - Measure real sync rate with the new pipeline; tune `DOWNLOADS` (watch for FloodWaits).
-- ETA in progress line.
 - Fuzzy search at scale: prefilter candidates with a trigram OR-query before rapidfuzz if scans get slow.
 
 **Coverage**
 - Videos: download → `ffmpeg` scene keyframes → OCR; audio → `mlx-whisper`. Cheap first pass: OCR Telegram's
   video thumbnail.
-- Images sent as files (documents with `image/*` mime), maybe stickers.
+- Stickers, maybe.
 - Album captions: propagate caption to all photos with the same `grouped_id`.
 - More metadata: forwarded-from, reply context, post author.
 - Handle edits/deletions (currently: edited captions not updated, deleted messages stay indexed).
@@ -273,7 +275,27 @@ take `YYYY-MM-DD`; `-n` limit (default 20); `--open` opens hits in Preview. Each
 - `cuda` device in `load_model`; relative paths (see Robustness) so the folder can be copied over.
 
 **Sources / UI**
-- VK (data archive export or API), local folders.
+- VK — researched 2026-10-10 (details below); next step needs the user's own data archive. Local folders.
+
+**VK source: research (2026-10-10)**
+- **User tokens**: Implicit / Authorization Code Flow switched off 2024-06-25; new apps only via VK ID (OAuth 2.1 +
+  PKCE, 1 h tokens + refresh). VK ID grants `vkid.personal_info`, `email`, `phone`; `photos` (and `friends`,
+  `video`, …) only "in exceptional cases" after business-profile verification + a request to devsupport.
+  `messages` with a user token: no longer granted at all ("contradicts product strategy"). Old non-revoked
+  offline tokens keep working.
+- **Quota since 2026-09-07**: 10,000 API calls/month per unverified VK ID account (100M verified; more = paid).
+  Fine for personal use (`photos.get` returns ≤1000 per call; image downloads are CDN, not API) — but Kate
+  Mobile died of it (shared app quota gone in 1.5 days), so borrowed client tokens are no option.
+- **Liked photos**: `fave.getPhotos` ("photos the current user has liked") still answers but left the schema by
+  2019; photo objects carry the upload `date`, no like date found anywhere.
+- **Saved photos**: `photos.get` with `album_id=saved` (user token only → blocked like above).
+- **Group walls**: `wall.get` (≤100 posts/call) works with the VK ID app's *service key* → doable via API.
+- **Data archive** (vk.com/data_protection → request; official, manual, hours–days): as of 2024 `photos/` = album
+  pages with direct image URLs + dates, `messages/` = chat pages with direct photo attachment URLs (no login
+  needed), `likes/photo` = `vk.com/photo…` links only (resolved via the page's og:image with browser cookies,
+  e.g. VKArchiveDownloader). Encoding cp1251. Structure must be re-checked on a 2026 archive.
+- **Schema prerequisite**: a `source` (telegram/vk) next to chat/msg ids — ids collide across sources; links
+  stop being `tglink()`-derived; `images.photo_id` must not mix id spaces.
 - Web UI auth (login/password or token) — required before binding `serve` to anything but 127.0.0.1.
 - Web UI: lightbox instead of opening the image in a new tab, collapsible filters on phones,
   sync trigger/progress from the UI.
