@@ -785,17 +785,18 @@ def repair(tg, db, dialogs):
                     bar.update(len(batch))
             print(f"  {gone} deleted in Telegram, {edited} captions edited")
         restored = 0
-        for img, path in tqdm(missing.items(), desc="missing files", unit="file"):
+        for img, path in tqdm(missing.items(), desc="missing files", unit="file", disable=not missing):
             # its own message first: other appearances may be smaller copies (dedup keeps the biggest)
-            for k in sorted(sent_in[img], key=lambda k: Path(path).with_suffix("").parts[-2:] != tuple(map(str, k))):
+            own = lambda k: Path(path).with_suffix("").parts[-2:] != tuple(map(str, k))
+            for k in sorted((k for k in sent_in[img] if k in alive), key=own):
                 Path(path).parent.mkdir(parents=True, exist_ok=True)
-                if k in alive and tg.download_media(alive[k], file=path):
+                if tg.download_media(alive[k], file=path):
                     restored += 1
                     break
     except KeyboardInterrupt:
         return print("\nstopped, run repair again (it checks everything anew)")
     print(f"  {restored} of {len(missing)} missing files downloaded again" +
-          (f", the rest are gone from Telegram (or from the chats checked)" if restored < len(missing) else "") +
+          (", the rest are gone from Telegram (or from the chats checked)" if restored < len(missing) else "") +
           (f"; {len(moved)} skipped: their paths point outside {HERE} (folder moved?)" if moved else ""))
     embed(db)  # restored files that never got a vector
 

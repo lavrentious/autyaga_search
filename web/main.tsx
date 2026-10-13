@@ -28,12 +28,13 @@ import { Notifications, notifications } from "@mantine/notifications";
 import { useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 
-type Appearance = { date: string; chat: string; sender: string; link: string; msg_id: number };
+type Appearance = { date: string; chat: string; sender: string; link: string; msg_id: number; deleted: boolean };
 type Hit = {
   image_id: number; // a picture is stored once; `appearances` = every message it was sent in
   appearances: Appearance[];
   msg_id: number;
   chat_id: number;
+  deleted: boolean; // the message is gone from Telegram (found by `repair`); the picture stays indexed
   album: number; // photos in this message's album (0 = not part of one)
   date: string;
   chat: string;
@@ -163,6 +164,11 @@ function Result({
       <Stack gap={6} miw={0} style={{ flex: 1 }}>
         <Text size="xs" c="dimmed">
           {hit.date} · {hit.chat} / {hit.sender} · msg {hit.msg_id}
+          {hit.deleted && (
+            <Badge size="xs" color="red" variant="light" ml={6} title="The message is gone from Telegram; the picture stays indexed">
+              deleted in Telegram
+            </Badge>
+          )}
         </Text>
         {tags && tags.length > 0 && (
           <Group gap={4} title="What the model sees · click to search by meaning">
@@ -179,7 +185,12 @@ function Result({
             {hit.appearances.map((a, i) => (
               <span key={i}>
                 {i > 0 && " · "}
-                <Anchor href={a.link} inherit title={`msg ${a.msg_id} · by ${a.sender}`}>
+                <Anchor
+                  href={a.link}
+                  inherit
+                  td={a.deleted ? "line-through" : undefined}
+                  title={`msg ${a.msg_id} · by ${a.sender}${a.deleted ? " · deleted in Telegram" : ""}`}
+                >
                   {a.chat}, {a.date.slice(0, 10)}
                 </Anchor>
               </span>

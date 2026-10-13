@@ -24,6 +24,7 @@ uv run tgsearch.py search --album 568363             # all photos of the album t
 uv run tgsearch.py search "пароль" --sort relevance  # new (default) / old / relevance
 uv run --env-file .env tgsearch.py embed [--model HF_ID]  # vectors for photos missing them (sync runs this too)
 uv run tgsearch.py dedup                          # merge copies of a picture already indexed (copies -> Trash)
+uv run --env-file .env tgsearch.py repair [<id|name>...]  # check indexed messages against Telegram (see below)
 uv run tgsearch.py serve [--port 8000]            # web UI + API on http://127.0.0.1:8000 (localhost only)
 uv run tgsearch.py help [command]                 # also shown when run without arguments
 uv run test_tgsearch.py                           # logic self-check (no Telegram/OCR needed)
@@ -143,6 +144,12 @@ take `YYYY-MM-DD`; `-n` limit (default 20); `--open` opens hits in Preview. Each
   photos and backfills earlier ones of that chat (`get_messages(ids=…)`, 100 per request, no downloads).
   `album=(chat_id|None, msg_id)` filter shows the album in message order; results carry the album size
   (UI "Album (N)" button + banner; CLI "(album of N: --album …)").
+- **Repair** (`repair`, same chat arguments as `sync`): re-fetches every indexed message (`get_messages(ids=…)`,
+  100 per request). Gone from Telegram → row in `deleted(chat_id, msg_id)`, the row itself stays searchable
+  (UI "deleted in Telegram" badge / struck-through appearance, CLI "(deleted in Telegram)"); edited caption →
+  updated; chat renamed → updated. Pictures whose file is missing on disk are downloaded again from a message
+  still there, their own message first (other appearances may be smaller copies). Missing paths outside the
+  folder (moved, see Robustness) are skipped, not recreated. Idempotent; ends with `embed`.
 
 ## Decisions & gotchas
 
@@ -245,7 +252,8 @@ take `YYYY-MM-DD`; `-n` limit (default 20); `--open` opens hits in Preview. Each
 - Stickers, maybe.
 - Album captions: propagate caption to all photos with the same `grouped_id`.
 - More metadata: forwarded-from, reply context, post author.
-- Handle edits/deletions (currently: edited captions not updated, deleted messages stay indexed).
+- Edits/deletions are only picked up by `repair` (not by `sync`); `repair` doesn't notice a photo replaced by
+  editing the message, nor renamed senders.
 - Verify which client opens `tg://openmessage` links; `--tg` flag to open the top hit in Telegram.
 
 **Dedup follow-ups**

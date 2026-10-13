@@ -232,4 +232,37 @@ async def merged(a, b):
     return [m.id async for m in tgsearch.merge(msgs(*a), msgs(*b))]
 assert asyncio.run(merged([1, 4, 5], [2, 3, 6, 7])) == [1, 2, 3, 4, 5, 6, 7]
 assert asyncio.run(merged([], [2])) == [2] and asyncio.run(merged([1], [])) == [1] and asyncio.run(merged([], [])) == []
+
+# repair, against a fake Telegram: msg 3 deleted there, msg 4's caption edited, the picture of msgs 1 and 2 lost
+# its file (saved from msg 2: downloaded from there, not from the copy in msg 1), msg 6's path is outside the folder
+with tempfile.TemporaryDirectory() as d:
+    tgsearch.HERE = Path(d)
+    tgsearch.embed = lambda db: None  # tested above
+    (Path(d) / "media/5").mkdir(parents=True)
+    for mid in (3, 4):
+        Image.new("RGB", (8, 8)).save(f"{d}/media/5/{mid}.jpg")
+    r = connect(":memory:")
+    add(r, 5, "Old name", 1, "2024-01-01 00:00", "s", "", "", f"{d}/media/5/2.jpg")
+    add(r, 5, "Old name", 2, "2024-01-02 00:00", "s", "", "", f"{d}/media/5/2.jpg", image=1)
+    add(r, 5, "Old name", 3, "2024-01-03 00:00", "s", "", "", f"{d}/media/5/3.jpg")
+    add(r, 5, "Old name", 4, "2024-01-04 00:00", "s", "old", "", f"{d}/media/5/4.jpg")
+    add(r, 5, "Old name", 6, "2024-01-06 00:00", "s", "", "", "/elsewhere/media/5/6.jpg")
+    alive = {i: SimpleNamespace(id=i, message="new ё" if i == 4 else "") for i in (1, 2, 4, 6)}
+    fetched = []
+
+    class FakeTelegram:
+        def get_messages(self, chat, ids):
+            return [alive.get(i) for i in ids]
+
+        def download_media(self, m, file):
+            fetched.append(m.id)
+            Image.new("RGB", (8, 8)).save(file, "JPEG")
+            return file
+    tgsearch.repair(FakeTelegram(), r, [SimpleNamespace(id=5, name="Новое имя")])
+    assert r.execute("SELECT * FROM deleted").fetchall() == [(5, 3)] and search(r, msg_id=3)[0][-2] == 1
+    assert r.execute("SELECT caption FROM media WHERE msg_id = 4").fetchone() == ("new е",)
+    assert fetched == [2] and Path(f"{d}/media/5/2.jpg").exists() and not Path("/elsewhere").exists()
+    assert {c for (c,) in r.execute("SELECT chat FROM media")} == {"Новое имя"}
+    tgsearch.repair(FakeTelegram(), r, [SimpleNamespace(id=5, name="Новое имя")])  # again: nothing to do
+    assert fetched == [2] and r.execute("SELECT count(*) FROM deleted").fetchone() == (1,)
 print("ok")
