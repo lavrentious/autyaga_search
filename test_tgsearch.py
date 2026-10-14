@@ -1,5 +1,5 @@
 # /// script
-# dependencies = ["rapidfuzz", "numpy", "pillow", "imagehash", "tqdm"]
+# dependencies = ["rapidfuzz", "numpy", "pillow", "pillow-heif", "imagehash", "tqdm"]
 # ///
 """uv run test_tgsearch.py — checks indexing/search/dedup logic (no Telegram, no OCR, no model)."""
 import asyncio
@@ -176,6 +176,9 @@ with tempfile.TemporaryDirectory() as d:
     Path(f"{d}/bomb.png").write_bytes(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 50000, 50000,
                                       8, 2, 0, 0, 0)) + chunk(b"IEND", b""))
     assert phash(f"{d}/bomb.png") is None
+    tgsearch.open_image(f"{d}/m.png")  # registers HEIC support, which saving below needs too
+    meme("SOME CAPTION HERE").save(f"{d}/m.heic")  # iPhone photo sent as a file: read in memory, kept as sent
+    assert (phash(f"{d}/m.png") ^ phash(f"{d}/m.heic")).bit_count() <= tgsearch.DUP_HASH_BITS
     assert same_picture(f"{d}/m.png", f"{d}/m_copy.jpg", "", "")
     assert not same_picture(f"{d}/m.png", f"{d}/m_other.png", "SOME CAPTION HERE", "OTHER WORDS THERE")
     assert not same_picture(f"{d}/m.png", f"{d}/nope.png", "", "")  # unreadable: never merge
@@ -270,10 +273,11 @@ with tempfile.TemporaryDirectory() as d:
     add(r, 5, "Old name", 4, "2024-01-04 00:00", "s", "old", "", f"{d}/media/5/4.jpg")
     add(r, 5, "Old name", 6, "2024-01-06 00:00", "s", "", "", "/elsewhere/media/5/6.jpg")
     alive = {i: SimpleNamespace(id=i, message="new ё" if i == 4 else "") for i in (1, 2, 4, 6)}
-    fetched = []
+    fetched, asked = [], []
 
     class FakeTelegram:
         def get_messages(self, chat, ids):
+            asked.extend(ids)
             return [alive.get(i) for i in ids]
 
         def download_media(self, m, file):
@@ -287,6 +291,10 @@ with tempfile.TemporaryDirectory() as d:
     assert {c for (c,) in r.execute("SELECT chat FROM media")} == {"Новое имя"}
     tgsearch.repair(FakeTelegram(), r, [SimpleNamespace(id=5, name="Новое имя")])  # again: nothing to do
     assert fetched == [2] and r.execute("SELECT count(*) FROM deleted").fetchone() == (1,)
+    Path(f"{d}/media/5/2.jpg").unlink()  # --missing: asks only for the messages of the missing picture
+    asked.clear()
+    tgsearch.repair(FakeTelegram(), r, [SimpleNamespace(id=5, name="Новое имя")], missing_only=True)
+    assert asked == [1, 2] and fetched == [2, 2] and Path(f"{d}/media/5/2.jpg").exists()
 
 # vk: an archive's saved photos (image links; one expired) and likes (bare links: each photo's page is read), against
 # a fake VK. Pictures a/b/c; the liked -5_7 is picture a again, -5_8's page shows nothing.

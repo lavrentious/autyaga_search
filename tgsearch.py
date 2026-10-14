@@ -1,7 +1,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = ["telethon", "ocrmac", "qrcode", "iterfzf", "rapidfuzz", "fastapi", "uvicorn",
-#                 "torch", "transformers>=5", "numpy", "pillow", "imagehash", "tqdm"]
+#                 "torch", "transformers>=5", "numpy", "pillow", "pillow-heif", "imagehash", "tqdm"]
 # ///
 """Index photos (and images sent as files) from selected Telegram chats (OCR via Apple Vision) and search them.
 
@@ -409,9 +409,12 @@ def embed(db, name=MODEL, batch=32):
 def open_image(path):
     """Image.open, with Pillow's decompression-bomb limit (~179M pixels) raised for huge scans/panoramas sent as
     files. Files claiming even more raise OSError, which callers treat as unreadable: a crafted few-KB PNG can
-    claim billions of pixels, and decoding it would eat all memory on every sync retry."""
+    claim billions of pixels, and decoding it would eat all memory on every sync retry. HEIC/HEIF (iPhone photos
+    sent as files) decode via pillow-heif, in memory: the file stays as sent."""
     from PIL import Image
+    from pillow_heif import register_heif_opener
 
+    register_heif_opener()
     Image.MAX_IMAGE_PIXELS = 500_000_000  # Pillow refuses 2x this: 1G pixels, ~3 GB decoded as RGB
     try:
         return Image.open(path)
@@ -784,9 +787,10 @@ async def sync_chat(tg, db, d):
           f"({n / max(time.time() - t0, 1e-9):.1f}/s)")
 
 
-def repair(tg, db, dialogs):
+def repair(tg, db, dialogs, missing_only=False):
     """Bring the index in line with Telegram: messages deleted there get marked (rows and files stay), edited
-    captions and renamed chats get updated, and pictures whose file is missing are downloaded again."""
+    captions and renamed chats get updated, and pictures whose file is missing are downloaded again.
+    missing_only: just the last part, fetching only the messages those pictures were sent in (few requests)."""
     from tqdm import tqdm
 
     missing = {i: p for i, p in db.execute("SELECT id, path FROM images") if not file(p).exists()}
@@ -804,6 +808,8 @@ def repair(tg, db, dialogs):
                 db.execute("UPDATE media SET chat = ? WHERE chat_id = ? AND chat != ?", (norm(d.name), d.id, norm(d.name)))
             rows = db.execute(f"SELECT rowid, msg_id, caption FROM media WHERE chat_id = ? AND NOT {DELETED}",
                               (d.id,)).fetchall()
+            if missing_only and not (rows := [r for r in rows if (d.id, r[1]) in wanted]):
+                continue  # nothing missing here: no requests
             gone = edited = 0
             with tqdm(total=len(rows), desc=d.name, unit="msg") as bar:
                 for i in range(0, len(rows), 100):
@@ -1019,9 +1025,12 @@ def disk_usage():
 def serve(port):
     from typing import Literal
 
+    import io
+
     import uvicorn
-    from fastapi import FastAPI
+    from fastapi import FastAPI, HTTPException, Response
     from fastapi.staticfiles import StaticFiles
+    from starlette.concurrency import run_in_threadpool
 
     app = FastAPI()
 
@@ -1068,7 +1077,21 @@ def serve(port):
 
     if connect().execute("SELECT 1 FROM emb WHERE model = ? LIMIT 1", (MODEL,)).fetchone():  # warm up (~10 s)
         threading.Thread(target=lambda: tags(connect(), []), daemon=True).start()  # model + tag labels
-    app.mount("/media", StaticFiles(directory=HERE / "media", check_dir=False))
+    class Media(StaticFiles):  # files browsers can't show (Safari aside) go out as JPEG, converted per request
+        async def get_response(self, path, scope):
+            if Path(path).suffix.lower() not in (".heic", ".heif", ".tif", ".tiff", ".psd"):
+                return await super().get_response(path, scope)
+            full, _ = self.lookup_path(path)  # StaticFiles' own lookup: stays inside media/
+            if not full:
+                raise HTTPException(404)
+
+            def jpeg():
+                buf = io.BytesIO()
+                open_image(full).convert("RGB").save(buf, "JPEG", quality=90)
+                return buf.getvalue()
+            return Response(await run_in_threadpool(jpeg), media_type="image/jpeg")  # ~0.5 s for 12 MP
+
+    app.mount("/media", Media(directory=HERE / "media", check_dir=False))
     app.mount("/", StaticFiles(directory=HERE / "web" / "dist", html=True, check_dir=False))
     # ponytail: no auth, so localhost only; add auth before binding to anything else
     uvicorn.run(app, host="127.0.0.1", port=port)
@@ -1107,9 +1130,11 @@ def main():
                    "(default: relevance when searching text/--meaning/--similar, else new)")
     sub.add_parser("embed").add_argument("--model", default=MODEL, help=f"HF model id (default {MODEL})")
     sub.add_parser("dedup", help="merge copies of the same picture already indexed (copies' files go to the Trash)")
-    sub.add_parser("repair", help="mark messages deleted in Telegram (rows stay), update edited captions and chat "
-                   "names, re-download files missing on disk").add_argument(
-        "chat", nargs="*", help="dialog id or exact name; none = every chat already indexed")
+    r = sub.add_parser("repair", help="mark messages deleted in Telegram (rows stay), update edited captions and chat "
+                       "names, re-download files missing on disk")
+    r.add_argument("chat", nargs="*", help="dialog id or exact name; none = every chat already indexed")
+    r.add_argument("--missing", action="store_true", help="only re-download missing files: fetches just their "
+                   "messages instead of checking every indexed one (no flood waits)")
     v = sub.add_parser("vk", help="index photo albums (saved photos, ...) and liked photos from a VK data archive")
     v.add_argument("archive", help="the archive (.zip or its unpacked folder), from vk.com/data_protection with "
                    "\"Фотографии\" and/or \"Отметки «Мне нравится»\"; rerun to resume or add a newer one")
@@ -1142,7 +1167,10 @@ def main():
         if not targets:
             return print("nothing indexed yet: name the chats to sync, or pick them with `chats`")
         with client() as tg:
-            (sync if a.cmd == "sync" else repair)(tg, db, find(tg, targets))
+            if a.cmd == "sync":
+                sync(tg, db, find(tg, targets))
+            else:
+                repair(tg, db, find(tg, targets), a.missing)
     else:
         db = connect()
         rows = search(db, a.text, a.caption, a.sender, a.chat, a.after, a.before, a.n,

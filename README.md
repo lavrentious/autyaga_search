@@ -24,7 +24,7 @@ uv run tgsearch.py search --album 568363             # all photos of the album t
 uv run tgsearch.py search "пароль" --sort relevance  # new (default) / old / relevance
 uv run --env-file .env tgsearch.py embed [--model HF_ID]  # vectors for photos missing them (sync runs this too)
 uv run tgsearch.py dedup                          # merge copies of a picture already indexed (copies -> Trash)
-uv run --env-file .env tgsearch.py repair [<id|name>...]  # check indexed messages against Telegram (see below)
+uv run --env-file .env tgsearch.py repair [<id|name>...] [--missing]  # check indexed messages against Telegram (see below)
 uv run tgsearch.py vk Archive.zip [--cookies vk.txt] [--retry]  # VK albums + liked photos from its data archive
 uv run tgsearch.py serve [--port 8000]            # web UI + API on http://127.0.0.1:8000 (localhost only)
 uv run tgsearch.py help [command]                 # also shown when run without arguments
@@ -180,7 +180,14 @@ take `YYYY-MM-DD`; `-n` limit (default 20); `--open` opens hits in Preview. Each
   (UI "deleted in Telegram" badge / struck-through appearance, CLI "(deleted in Telegram)"); edited caption →
   updated; chat renamed → updated. Pictures whose file is missing on disk are downloaded again from a message
   still there, their own message first (other appearances may be smaller copies). Missing files stored with an
-  absolute path outside the folder are skipped, not recreated. Idempotent; ends with `embed`.
+  absolute path outside the folder are skipped, not recreated. Idempotent; ends with `embed`. `--missing`: only
+  the re-download part, fetching just the messages of pictures whose file is gone (the full check asks for every
+  indexed message, 100 per request, and runs into flood waits on big chats); chats without missing files cost
+  no request.
+- **Image formats**: stored as sent (jpg ~22.9k, png, gif, heic, tif, psd). `open_image()` (embeddings,
+  fingerprints, copy checks) reads HEIC/HEIF through `pillow-heif`, in memory; OCR (Vision) reads them natively.
+  Browsers bar Safari can't show HEIC, TIFF or PSD, so `serve`'s `/media` converts those to JPEG per request
+  (0.05–0.5 s; StaticFiles' own path lookup, so requests stay inside `media/`).
 
 ## Decisions & gotchas
 
@@ -237,6 +244,10 @@ take `YYYY-MM-DD`; `-n` limit (default 20); `--open` opens hits in Preview. Each
 - **2026-10-09**: Combinable search: separate Text and Meaning boxes (CLI `--meaning DESCRIPTION`), both + Similar
   together; Similar clears the boxes but combines with anything typed after. `fuzzy_rank` + `semantic_rank`
   merged into `rank()`.
+- **2026-10-14**: HEIC photos sent as files are read (`pillow-heif`): the 13 that had no embedding got one;
+  the web UI shows HEIC/TIFF/PSD (converted to JPEG on the fly). `repair --missing`: only re-downloads missing
+  files, without re-checking every message (flood waits). Run `dedup` to fingerprint the HEICs (and merge them
+  with JPEG copies, if any).
 - **2026-10-14**: Schema v1 (versioned migrations): `source` + `url` stored per appearance, `media.path` and
   `links` dropped, paths relative to the folder. Migrated the real index in ~2 s (backup `media.db.bak-v0`);
   counts, search totals per source, links and files verified identical before/after. Web UI: source badge and
