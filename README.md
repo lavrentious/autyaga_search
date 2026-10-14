@@ -114,9 +114,11 @@ take `YYYY-MM-DD`; `-n` limit (default 20); `--open` opens hits in Preview. Each
   drop out as soon as a picture query is given. Exact text alone stays all-SQL (FTS rank + `snippet()`).
 - **Web UI** (`serve`): FastAPI inside `tgsearch.py` reuses `search_page()` as is. `GET /api/search` (CLI's params:
   `q, ocr, caption, meaning, similar, sender, chat, after, before, msg, album, exact, min_score, order, model`, plus
-  `page` + `limit`) → `{total, hits}`; `GET /api/chats` (names + counts
-  for the dropdown), `/media` and `/` are static mounts (`media/`, `web/dist/`). Frontend searches as you type
-  (250 ms debounce, stale requests aborted). **Pages** of 60: every page is a slice of one ranking (for
+  `page` + `limit`, `chat_id` = comma-separated ids) → `{total, hits}`, each hit with its file `size` (null =
+  missing on disk); `GET /api/chats` (names, counts and bytes in `media/<chat_id>/` for the multi-select chat
+  filter; their sum is the "on disk" total), `/media` and `/` are static mounts (`media/`, `web/dist/`).
+  Frontend searches as you type (250 ms debounce, stale requests aborted; the spinner sits in the sticky status
+  line, results stay usable meanwhile). **Pages** of 60: every page is a slice of one ranking (for
   Meaning/Similar sorted by date: page n = the n-th 60 best, by date), total from the same pass. **URL = search
   state**: non-default filters + page are the query string (shareable, survive reload; the same string is the API
   query); a page change is a history step (Back = previous page), typing replaces the entry. After a reload the

@@ -15,6 +15,7 @@ import {
   Loader,
   MantineProvider,
   Mark,
+  MultiSelect,
   NumberInput,
   Pagination,
   Select,
@@ -35,6 +36,7 @@ type Hit = {
   msg_id: number;
   chat_id: number;
   deleted: boolean; // the message is gone from Telegram (found by `repair`); the picture stays indexed
+  size: number | null; // bytes of the picture's file, null = missing on disk (`repair` downloads it again)
   album: number; // photos in this message's album (0 = not part of one)
   date: string;
   chat: string;
@@ -45,13 +47,13 @@ type Hit = {
   ocr: string;
   caption: string;
 };
-type Chat = { id: number; name: string; count: number };
+type Chat = { id: number; name: string; count: number; bytes: number }; // bytes on disk in media/<id>/
 type Model = { name: string; count: number };
 
 const PAGE = 60;
 const EMPTY = {
   ocr: "", // text in the picture (OCR)
-  chat_id: "", // exact chat (names can repeat, e.g. a group and the supergroup it was upgraded to)
+  chat_id: "", // exact chats, "id,id,…" (names can repeat, e.g. a group and the supergroup it was upgraded to)
   sender: "",
   caption: "", // text in the message
   after: "",
@@ -92,6 +94,9 @@ function fromUrl(): Filters {
 }
 
 const fail = (message: string) => notifications.show({ color: "red", message });
+// decimal units, like Finder
+const fmtSize = (b: number) =>
+  b < 1e6 ? `${Math.round(b / 1e3)} KB` : b < 1e9 ? `${(b / 1e6).toFixed(1)} MB` : `${(b / 1e9).toFixed(2)} GB`;
 
 // navigator.clipboard exists only on https/localhost pages; opened as http://<lan-ip> (e.g. from a phone) it's
 // undefined, so fall back to the legacy copy command, which still works inside a click handler
@@ -163,7 +168,7 @@ function Result({
       </Anchor>
       <Stack gap={6} miw={0} style={{ flex: 1 }}>
         <Text size="xs" c="dimmed">
-          {hit.date} · {hit.chat} / {hit.sender} · msg {hit.msg_id}
+          {hit.date} · {hit.chat} / {hit.sender} · msg {hit.msg_id} · {hit.size === null ? "file missing" : fmtSize(hit.size)}
           {hit.deleted && (
             <Badge size="xs" color="red" variant="light" ml={6} title="The message is gone from Telegram; the picture stays indexed">
               deleted in Telegram
@@ -348,7 +353,6 @@ function App() {
             size="md"
             autoFocus
             style={{ flex: "1 1 200px" }}
-            rightSection={loading && <Loader size="xs" />}
             placeholder="Text in the picture"
             value={filters.ocr}
             onChange={(e) => set("ocr", e.currentTarget.value)}
@@ -371,18 +375,31 @@ function App() {
           )}
         </Group>
         <Group gap="xs" mt="xs">
-          <Select
+          <MultiSelect
             size="xs"
-            placeholder="All chats"
+            placeholder={filters.chat_id ? undefined : "All chats"}
             searchable
             clearable
+            style={{ flex: "0 1 320px" }}
+            hidePickedOptions
             data={chats.map((c) => ({
               value: String(c.id),
               // a repeated name gets its id, so the two are told apart
-              label: `${c.name} (${c.count})${chats.some((o) => o.name === c.name && o.id !== c.id) ? ` · ${c.id}` : ""}`,
+              label: `${c.name}${chats.some((o) => o.name === c.name && o.id !== c.id) ? ` · ${c.id}` : ""}`,
             }))}
-            value={filters.chat_id || null}
-            onChange={(v) => set("chat_id", v ?? "")}
+            renderOption={({ option }) => {
+              const c = chats.find((c) => String(c.id) === option.value)!;
+              return (
+                <Group justify="space-between" wrap="nowrap" gap="md" w="100%">
+                  <span>{option.label}</span>
+                  <Text size="xs" c="dimmed" style={{ whiteSpace: "nowrap" }}>
+                    {c.count} · {fmtSize(c.bytes)}
+                  </Text>
+                </Group>
+              );
+            }}
+            value={filters.chat_id ? filters.chat_id.split(",") : []}
+            onChange={(v) => set("chat_id", v.join(","))}
           />
           <TextInput size="xs" placeholder="Sender" value={filters.sender} onChange={(e) => set("sender", e.currentTarget.value)} />
           <TextInput
@@ -465,14 +482,25 @@ function App() {
             <CloseButton size="sm" aria-label="Clear" onClick={() => set("similar", "")} />
           </Group>
         )}
+        {/* status line: in the sticky header so the spinner shows wherever the page is scrolled; results stay usable */}
+        <Group justify="space-between" wrap="nowrap" mt="xs" gap="xs">
+          <Group gap={8} wrap="nowrap">
+            <Text size="sm" c="dimmed">
+              {hits === null
+                ? "Loading…"
+                : `${total} result${total === 1 ? "" : "s"}${pages > 1 ? ` · page ${debounced.page} of ${pages}` : ""}`}
+            </Text>
+            {loading && <Loader size={14} />}
+          </Group>
+          {chats.length > 0 && (
+            <Text size="sm" c="dimmed" title="Downloaded pictures (media/); a picture sent in several chats is stored once">
+              {fmtSize(chats.reduce((sum, c) => sum + c.bytes, 0))} on disk
+            </Text>
+          )}
+        </Group>
       </Box>
 
-      <Text size="sm" c="dimmed" my="xs">
-        {hits === null
-          ? "Loading…"
-          : `${total} result${total === 1 ? "" : "s"}${pages > 1 ? ` · page ${debounced.page} of ${pages}` : ""}`}
-      </Text>
-      <Stack gap={0}>
+      <Stack gap={0} mt="xs">
         {hits?.map((h) => (
           <div key={h.image_id}>
             <Divider />

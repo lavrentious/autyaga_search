@@ -172,7 +172,7 @@ def search(*args, **kw):
 
 def search_page(db, text=None, caption=None, sender=None, chat=None, after=None, before=None, limit=20,
                 min_score=None, model=MODEL, similar=None, msg_id=None, order="new", album=None, meaning=None, ocr=None,
-                offset=0, chat_id=None):
+                offset=0, chat_ids=None):
     """(rows `offset`..`offset + limit`, total pictures matching). One row per picture; every given criterion applies. Text queries decide what matches: `ocr` in the
     picture's text, `caption` in the message's, `text` in either; fuzzy (typos, OCR errors) if min_score is
     set, else exact substring. `meaning` (a description) and `similar` (an image id) score what's in the
@@ -201,9 +201,9 @@ def search_page(db, text=None, caption=None, sender=None, chat=None, after=None,
     if msg_id:
         where.append("msg_id = ?")
         params.append(msg_id)
-    if chat_id:  # exact chat; `chat` is a name substring (names repeat: a group upgraded to a supergroup gets a new id)
-        where.append("chat_id = ?")
-        params.append(chat_id)
+    if chat_ids:  # exact chats; `chat` is a name substring (names repeat: a group upgraded to a supergroup gets a new id)
+        where.append(f"chat_id IN ({','.join('?' * len(chat_ids))})")
+        params += chat_ids
     if album:
         where.append("""(chat_id, msg_id) IN (SELECT a.chat_id, a.msg_id FROM albums a JOIN albums b
             ON a.chat_id = b.chat_id AND a.grouped_id = b.grouped_id WHERE b.msg_id = ? AND (? IS NULL OR b.chat_id = ?))""")
@@ -801,6 +801,13 @@ def repair(tg, db, dialogs):
     embed(db)  # restored files that never got a vector
 
 
+def disk_usage():
+    """chat_id -> bytes in media/<chat_id>/. A picture sent in several chats is stored once, under the first."""
+    media = HERE / "media"
+    return {int(d.name): sum(f.stat().st_size for f in os.scandir(d) if f.is_file())
+            for d in (os.scandir(media) if media.exists() else []) if d.is_dir() and d.name.lstrip("-").isdigit()}
+
+
 def serve(port):
     from typing import Literal
 
@@ -814,19 +821,20 @@ def serve(port):
     def api_search(q: str = "", ocr: str = "", caption: str = "", sender: str = "", chat: str = "", after: str = "",
                    before: str = "", exact: bool = False, min_score: int = 80, limit: int = 60,
                    meaning: str = "", model: str = MODEL, similar: int = 0, msg: int = 0,
-                   order: Literal[ORDERS] = "new", album: str = "", page: int = 1, chat_id: int = 0):
+                   order: Literal[ORDERS] = "new", album: str = "", page: int = 1, chat_id: str = ""):
         db = connect()
         limit = min(limit, 1000)
         rows, total = search_page(db, q or None, caption or None, sender or None, chat or None, after or None,
                                   before or None, limit, None if exact else min_score, model, similar or None,
                                   msg or None, order, tuple(int(x) for x in album.split(":")) if album else None,
                                   meaning or None, ocr or None, (max(page, 1) - 1) * limit,  # album: "chat_id:msg_id"
-                                  chat_id or None)
+                                  [int(c) for c in chat_id.split(",") if c])  # chat_id: "id,id,…"
         seen = appearances(db, [r[IMAGE] for r in rows])
         sizes = album_sizes(db, [(r[7], r[8]) for r in rows])
         return {"total": total, "hits": [
             {"image_id": img, "msg_id": mid, "chat_id": cid, "album": sizes.get((cid, mid), 0), "date": date, "chat": chat,
              "sender": sender, "link": url, "snippet": snip, "ocr": ocr, "caption": cap, "deleted": bool(gone),
+             "size": os.path.getsize(path) if os.path.exists(path) else None,
              "image": "/media/" + Path(path).relative_to(HERE / "media").as_posix(),
              "appearances": [dict(zip(("date", "chat", "sender", "link", "msg_id"), a), deleted=bool(a[5]))
                              for a in seen[img]]}
@@ -845,7 +853,8 @@ def serve(port):
     def api_chats():
         # by id: names repeat (e.g. a basic group and the supergroup it was upgraded to); max(date) -> latest name
         rows = connect().execute("SELECT chat_id, chat, max(date), count(*) FROM media GROUP BY chat_id ORDER BY 4 DESC")
-        return [{"id": cid, "name": name, "count": count} for cid, name, _, count in rows]
+        usage = disk_usage()
+        return [{"id": cid, "name": name, "count": count, "bytes": usage.get(cid, 0)} for cid, name, _, count in rows]
 
     if connect().execute("SELECT 1 FROM emb WHERE model = ? LIMIT 1", (MODEL,)).fetchone():  # warm up (~10 s)
         threading.Thread(target=lambda: tags(connect(), []), daemon=True).start()  # model + tag labels
