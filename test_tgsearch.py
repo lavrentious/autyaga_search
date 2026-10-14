@@ -3,10 +3,15 @@
 # ///
 """uv run test_tgsearch.py — checks indexing/search/dedup logic (no Telegram, no OCR, no model)."""
 import asyncio
+import io
+import json
 import sqlite3
 import struct
 import tempfile
+import time
+import urllib.error
 import zlib
+from email.message import Message
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,7 +19,7 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 import tgsearch
-from tgsearch import add, appearances, connect, dedup, embed, link, phash, same_picture, search, search_page
+from tgsearch import VK, add, appearances, connect, dedup, embed, link, phash, same_picture, search, search_page
 
 db = connect(":memory:")
 add(db, -1001234567890, "Работа", 1, "2024-03-01 10:00", "Вася Пупкин", "глянь", "Пароль от WiFi: ёлка2024", "/a.jpg")
@@ -188,7 +193,7 @@ with tempfile.TemporaryDirectory() as d:
     x.execute("INSERT INTO emb VALUES ('m', 1, x'00'), ('m', 2, x'00')")
     dedup(x)
     assert x.execute("SELECT id, path FROM images ORDER BY id").fetchall() == [(2, f"{d}/m.png"), (3, f"{d}/m_other.png")]
-    assert sorted(x.execute("SELECT msg_id, image, path, ocr FROM media")) == [  # each keeps its own OCR text
+    assert sorted(x.execute("SELECT msg_id, image, images.path, ocr FROM media JOIN images ON images.id = image")) == [  # each keeps its own OCR text
         (1, 2, f"{d}/m.png", "SOME CAPTION HERE"), (7, 2, f"{d}/m.png", "S0ME CAPTlON HERE"),
         (9, 3, f"{d}/m_other.png", "OTHER WORDS THERE")]
     assert x.execute("SELECT image FROM emb").fetchall() == [(2,)]
@@ -206,22 +211,38 @@ with tempfile.TemporaryDirectory() as d:
     assert tgsearch.tags(g, [1, 2, 3], "m", k=2) == {1: ["cat", "meme"], 2: ["dog", "meme"], 3: ["meme", "cat"]}
     assert tgsearch.tags(g, [1], "nope") == {}  # model without vectors: no tags, no crash
 
-    # migration from the pre-dedup layout (row + vector per message): lossless, one image per message
+    # migration 0 -> 1: source + url stored per appearance (VK's url from `links`, Telegram's computed), media.path
+    # dropped, picture paths relative to the folder (unless outside it); lossless, backed up, version set
     old = sqlite3.connect(f"{d}/old.db")
+    old.execute("CREATE TABLE images (id INTEGER PRIMARY KEY, path TEXT, phash TEXT, photo_id INTEGER UNIQUE)")
     old.execute("""CREATE VIRTUAL TABLE media USING fts5(ocr, caption, sender, chat, chat_id UNINDEXED,
-        msg_id UNINDEXED, date UNINDEXED, path UNINDEXED, tokenize='trigram')""")
-    old.execute("CREATE TABLE emb (model TEXT, chat_id INTEGER, msg_id INTEGER, vec BLOB, PRIMARY KEY (model, chat_id, msg_id))")
-    old.execute("INSERT INTO media VALUES ('текст', 'подпись', 'Вася', 'Чат', 5, 50, '2024-01-01 00:00', '/x.jpg')")
-    old.execute("INSERT INTO media VALUES ('', '', 'Петя', 'Чат', 5, 51, '2024-01-02 00:00', '/y.jpg')")
-    old.execute("INSERT INTO emb VALUES ('m', 5, 51, x'01')")
+        msg_id UNINDEXED, date UNINDEXED, path UNINDEXED, image UNINDEXED, tokenize='trigram')""")
+    old.execute("CREATE TABLE links (chat_id INTEGER, msg_id INTEGER, url TEXT, PRIMARY KEY (chat_id, msg_id)) WITHOUT ROWID")
+    old.executemany("INSERT INTO images (path) VALUES (?)", [(f"{d}/media/42/7.jpg",), ("/elsewhere/x.jpg",)])
+    old.execute(f"INSERT INTO media VALUES ('текст', 'подпись', 'Вася', 'Мама', 42, 7, '2024-01-01 00:00', '{d}/media/42/7.jpg', 1)")
+    old.execute(f"INSERT INTO media VALUES ('текст', '', '', 'VK: liked photos', {VK}, 1, '2024-01-02 00:00', '{d}/media/42/7.jpg', 1)")
+    old.execute("INSERT INTO media VALUES ('', '', 'Петя', 'Чат', -1001234567890, 9, '2024-01-03 00:00', '/elsewhere/x.jpg', 2)")
+    old.execute(f"INSERT INTO links VALUES ({VK}, 1, 'https://vk.ru/photo-5_7')")
     old.commit()
     old.close()
     new = connect(f"{d}/old.db")
-    assert new.execute("SELECT * FROM images").fetchall() == [(1, "/x.jpg", None, None), (2, "/y.jpg", None, None)]
-    assert new.execute("SELECT msg_id, image, caption FROM media").fetchall() == [(50, 1, "подпись"), (51, 2, "")]
-    assert new.execute("SELECT * FROM emb").fetchall() == [("m", 2, b"\x01")]
-    assert Path(f"{d}/old.db.bak-pre-dedup").exists()
-    assert [r[3] for r in search(new, text="текст")] == ["/x.jpg"]
+    assert new.execute("PRAGMA user_version").fetchone() == (tgsearch.VERSION,) and Path(f"{d}/old.db.bak-v0").exists()
+    assert new.execute("SELECT path FROM images").fetchall() == [("media/42/7.jpg",), ("/elsewhere/x.jpg",)]
+    assert new.execute("SELECT source, chat_id, msg_id, url, image FROM media").fetchall() == [
+        ("telegram", 42, 7, "tg://user?id=42", 1), ("vk", VK, 1, "https://vk.ru/photo-5_7", 1),
+        ("telegram", -1001234567890, 9, "https://t.me/c/1234567890/9", 2)]
+    assert not new.execute("SELECT 1 FROM sqlite_master WHERE name IN ('links', 'media_v0')").fetchall()
+    assert [r[3] for r in search(new, text="текст")] == ["media/42/7.jpg"] and search(new, sources=["vk"])[0][4].startswith("https://vk")
+    new.close()
+    assert connect(f"{d}/old.db").execute("SELECT count(*) FROM media").fetchone() == (3,)  # opened again: no rerun
+    try:  # pre-dedup layout: refused, not mangled
+        pre = sqlite3.connect(f"{d}/pre.db")
+        pre.execute("CREATE VIRTUAL TABLE media USING fts5(ocr, chat_id UNINDEXED, path UNINDEXED)")
+        pre.commit()
+        connect(f"{d}/pre.db")
+        assert False
+    except SystemExit:
+        pass
 
 # sync: photos and images sent as files come as two streams, merged back into message order (= resume order)
 async def msgs(*ids):
@@ -266,4 +287,69 @@ with tempfile.TemporaryDirectory() as d:
     assert {c for (c,) in r.execute("SELECT chat FROM media")} == {"Новое имя"}
     tgsearch.repair(FakeTelegram(), r, [SimpleNamespace(id=5, name="Новое имя")])  # again: nothing to do
     assert fetched == [2] and r.execute("SELECT count(*) FROM deleted").fetchone() == (1,)
+
+# vk: an archive's saved photos (image links; one expired) and likes (bare links: each photo's page is read), against
+# a fake VK. Pictures a/b/c; the liked -5_7 is picture a again, -5_8's page shows nothing.
+with tempfile.TemporaryDirectory() as d:
+    tgsearch.HERE = Path(d)
+    tgsearch.analyze = lambda p: ("", phash(p))  # no OCR here
+    jpeg = {}
+    for i, name in enumerate("abc"):
+        buf = io.BytesIO()
+        Image.fromarray(np.random.default_rng(i).integers(0, 255, (64, 64, 3), np.uint8)).save(buf, "JPEG")
+        jpeg[f"https://img/{name}.jpg"] = buf.getvalue()
+    jpeg["https://img/a.jpg?x=1&y=2"] = jpeg.pop("https://img/a.jpg")
+    viewer = lambda p, url, ts, author: "<script>ajax.preload('al_photos.php', {}, [" + json.dumps({
+        "accessKey": "k", "id": p, "date": f'<span data-date="{ts}">…</span>', "author": author, "desc": "",
+        "x_": ["https://img/small.jpg", 2, 2], "z_": [url, 64, 64]}, separators=(",", ":")) + "])</script>"  # VK's: no spaces
+    pages = {"https://vk.ru/photo1_3": "r.apiPrefetchCache = " + json.dumps([{"method": "photos.getById", "response": [
+                 {"date": 1, "text": "", "sizes": [{"width": 64, "height": 64, "url": "https://img/c.jpg"}]}]}]) + ";",
+             "https://vk.ru/photo-5_6": viewer("-5_6", "https://img/b.jpg", 1500000000, "Группа"),
+             "https://vk.ru/photo-5_7": viewer("-5_7", "https://img/a.jpg?x=1&y=2", 1600000000, "<a>Мемы &amp; co</a>"),
+             "https://vk.ru/photo-5_8": viewer("-5_8", "/images/x_null.gif", 1, "").replace(  # a gone photo
+                 "https://img/small.jpg", "/images/x_null.gif")}
+
+    fetched = []
+
+    def fake_get(opener, url):
+        fetched.append(url)
+        if url == "https://img/expired.jpg":
+            raise urllib.error.HTTPError(url, 403, "Forbidden", None, None)
+        h = Message()
+        h["Content-Type"] = "text/html; charset=utf-8" if url in pages else "image/jpeg"
+        return (pages[url].encode() if url in pages else jpeg[url]), h
+    tgsearch.vk_get = fake_get
+    item = lambda p, img="", desc="", place="", date="": (
+        f"""<div class="item"><div class='item__main'><a href="https://vk.ru/photo{p}">{img and f'<img src="{img}">'}"""
+        f"""</a></div><div class='item__main'>{desc}</div><div class='item__main'><a href="https://vk.ru/photo{p}">"""
+        f"""vk.ru/photo{p}</a></div><div class='item__tertiary'>{place}</div><div class='item__tertiary'>"""
+        f"""<div class="clear_fix">{date} </div></div></div>""")
+    archive = {  # newest first, like VK's; likes10 is older than likes2
+        "photos/photo-albums/-15.html": '<div class="ui_crumb" >Фотографии</div><div class="ui_crumb" >Сохранённые фото</div>'
+            + item("1_3", "https://img/expired.jpg", date="1 дек 2023 в 10:00")
+            + item("1_2", "https://img/a.jpg?x=1&amp;y=2", "Лето<br>на даче &#128526;", "Москва", "3 июл 2020 в 9:03"),
+        "likes/photo/likes2.html": item("-5_7"), "likes/photo/likes10.html": item("-5_8") + item("-5_6")}
+    for name, page in archive.items():
+        (Path(d) / "vk" / name).parent.mkdir(parents=True, exist_ok=True)
+        (Path(d) / "vk" / name).write_bytes(page.encode("cp1251", "xmlcharrefreplace"))
+    v = connect(":memory:")
+    local = lambda ts: time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+    for _ in range(2):  # the rerun adds nothing
+        tgsearch.vk_import(v, f"{d}/vk")
+        assert v.execute("SELECT chat_id, msg_id, chat, date, sender, caption, image FROM media ORDER BY 1, 2").fetchall() == [
+            (VK - 15, 1, "VK: Сохраненные фото", "2020-07-03 09:03", "", "Лето\nна даче 😎\nМосква", 1),
+            (VK - 15, 2, "VK: Сохраненные фото", "2023-12-01 10:00", "", "", 2),  # link expired: image via its page
+            (VK, 1, "VK: liked photos", local(1500000000), "Группа", "", 3),  # msg ids: like order (no like dates)
+            (VK, 2, "VK: liked photos", local(1600000000), "Мемы & co", "", 1)]  # a copy of the saved picture a
+    assert not Path(f"{d}/media/{VK}/-5_7.jpg").exists() and Path(f"{d}/media/{VK - 15}/1_2.jpg").exists()
+    assert [r[4] for r in search(v, chat_ids=[VK])] == ["https://vk.ru/photo-5_7", "https://vk.ru/photo-5_6"]
+    assert v.execute("SELECT DISTINCT source FROM media").fetchall() == [("vk",)]
+    add(v, 42, "Мама", 1, "2024-01-01 00:00", "Мама", None, "", f"{d}/media/{VK - 15}/1_2.jpg", image=1)  # in Telegram too
+    assert [r[7] for r in search(v, sources=["telegram"])] == [42] and len(search(v, sources=["vk"])) == 3
+    assert len(search(v, sources=["telegram", "vk"])) == len(search(v)) == 3  # one row per picture
+    v.execute("DELETE FROM media WHERE chat_id = 42")
+    assert fetched.count("https://vk.ru/photo-5_8") == 1  # showed nothing: remembered, the rerun didn't ask again
+    pages["https://vk.ru/photo-5_8"] = viewer("-5_8", "https://img/c.jpg", 1, "")  # visible now (e.g. joined the group)
+    tgsearch.vk_import(v, f"{d}/vk", retry=True)
+    assert v.execute("SELECT count(*) FROM vk_hidden").fetchone() == (0,) and len(search(v, chat_ids=[VK])) == 3
 print("ok")

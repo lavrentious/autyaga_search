@@ -6,6 +6,7 @@ import {
   Box,
   Button,
   Checkbox,
+  Chip,
   CloseButton,
   Container,
   Divider,
@@ -35,6 +36,7 @@ type Hit = {
   appearances: Appearance[];
   msg_id: number;
   chat_id: number;
+  source: string; // where this appearance comes from: "telegram", "vk"
   deleted: boolean; // the message is gone from Telegram (found by `repair`); the picture stays indexed
   size: number | null; // bytes of the picture's file, null = missing on disk (`repair` downloads it again)
   album: number; // photos in this message's album (0 = not part of one)
@@ -47,13 +49,18 @@ type Hit = {
   ocr: string;
   caption: string;
 };
-type Chat = { id: number; name: string; count: number; bytes: number }; // bytes on disk in media/<id>/
+type Chat = { id: number; name: string; source: string; count: number; bytes: number }; // bytes on disk in media/<id>/
 type Model = { name: string; count: number };
 
 const PAGE = 60;
+const SOURCES: Record<string, { label: string; color: string }> = {
+  telegram: { label: "Telegram", color: "cyan" },
+  vk: { label: "VK", color: "indigo" },
+};
 const EMPTY = {
   ocr: "", // text in the picture (OCR)
   chat_id: "", // exact chats, "id,id,…" (names can repeat, e.g. a group and the supergroup it was upgraded to)
+  source: "", // only these sources, "telegram,vk"; "" = all
   sender: "",
   caption: "", // text in the message
   after: "",
@@ -168,6 +175,9 @@ function Result({
       </Anchor>
       <Stack gap={6} miw={0} style={{ flex: 1 }}>
         <Text size="xs" c="dimmed">
+          <Badge size="xs" variant="light" color={SOURCES[hit.source]?.color ?? "gray"} mr={6}>
+            {SOURCES[hit.source]?.label ?? hit.source}
+          </Badge>
           {hit.date} · {hit.chat} / {hit.sender} · msg {hit.msg_id} · {hit.size === null ? "file missing" : fmtSize(hit.size)}
           {hit.deleted && (
             <Badge size="xs" color="red" variant="light" ml={6} title="The message is gone from Telegram; the picture stays indexed">
@@ -233,6 +243,10 @@ function Result({
           {hit.link.startsWith("https://t.me/") ? (
             <Button component="a" href={hit.link} size="compact-sm" variant="light">
               Open message
+            </Button>
+          ) : hit.link.startsWith("https://vk.") ? (
+            <Button component="a" href={hit.link} size="compact-sm" variant="light">
+              Open in VK
             </Button>
           ) : (
             <Button
@@ -375,6 +389,17 @@ function App() {
           )}
         </Group>
         <Group gap="xs" mt="xs">
+          {new Set(chats.map((c) => c.source)).size > 1 && (
+            <Chip.Group multiple value={filters.source ? filters.source.split(",") : []} onChange={(v) => set("source", v.join(","))}>
+              <Group gap={4} title="Only pictures from these sources (none picked = all)">
+                {[...new Set(chats.map((c) => c.source))].map((s) => (
+                  <Chip key={s} value={s} size="xs" color={SOURCES[s]?.color}>
+                    {SOURCES[s]?.label ?? s}
+                  </Chip>
+                ))}
+              </Group>
+            </Chip.Group>
+          )}
           <MultiSelect
             size="xs"
             placeholder={filters.chat_id ? undefined : "All chats"}

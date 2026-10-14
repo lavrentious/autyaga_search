@@ -25,6 +25,7 @@ uv run tgsearch.py search "пароль" --sort relevance  # new (default) / old
 uv run --env-file .env tgsearch.py embed [--model HF_ID]  # vectors for photos missing them (sync runs this too)
 uv run tgsearch.py dedup                          # merge copies of a picture already indexed (copies -> Trash)
 uv run --env-file .env tgsearch.py repair [<id|name>...]  # check indexed messages against Telegram (see below)
+uv run tgsearch.py vk Archive.zip [--cookies vk.txt] [--retry]  # VK albums + liked photos from its data archive
 uv run tgsearch.py serve [--port 8000]            # web UI + API on http://127.0.0.1:8000 (localhost only)
 uv run tgsearch.py help [command]                 # also shown when run without arguments
 uv run test_tgsearch.py                           # logic self-check (no Telegram/OCR needed)
@@ -34,7 +35,7 @@ Search flags: positional text matches the picture's text (OCR) **or** the messag
 match just one (UI: "Text in the picture" / "Message text" boxes); all given must match. Text is **fuzzy by
 default** (typos/OCR errors, score shown); `--exact` for indexed substring match; `--min-score` fuzziness knob
 (default 80; lower = looser; 3-letter fuzzy queries are noisy, use `--exact` for those). `--from`, `--chat` are
-exact substring filters; `--after`/`--before`
+exact substring filters; `--source telegram|vk` (repeatable; UI: source chips, none picked = all); `--after`/`--before`
 take `YYYY-MM-DD`; `-n` limit (default 20); `--open` opens hits in Preview. Each hit prints a message link (see below).
 
 ## Files
@@ -46,14 +47,35 @@ take `YYYY-MM-DD`; `-n` limit (default 20); `--open` opens hits in Preview. Each
 | `tags.txt` | label vocabulary for the "what the model sees" tags (one per line; edit, restart `serve`) |
 | `web/` | frontend: React + Vite + TS + Mantine, bun-managed; `main.tsx` is the whole app |
 | `web/dist/` | built frontend, served by `serve` (rebuild: `cd web && bun run build`) |
-| `media.db` (+ `-wal`, `-shm`) | WAL-mode SQLite: keep the three together, never copy `media.db` alone. The index: `images` (one per picture), `media` (FTS5, one row per appearance), `emb` |
-| `media.db.bak-pre-dedup`, `.bak-pre-repair` | backups from the 2026-10-08 dedup migration; delete when happy |
-| `media/<chat_id>/<msg_id>.<ext>` | downloaded photos and image files (kept: re-OCR/viewing without re-downloading) |
+| `media.db` (+ `-wal`, `-shm`) | WAL-mode SQLite: keep the three together, never copy `media.db` alone. The index: `images` (one per picture, its file), `media` (FTS5, one row per appearance: source, chat/msg ids, url, texts), `emb`; schema version in `PRAGMA user_version` |
+| `media.db.bak-*` | backups taken before migrations (`-pre-dedup`, `-pre-repair` 2026-10-08, `-v0` 2026-10-14); delete when happy |
+| `media/<chat_id>/<msg_id>.<ext>` | downloaded photos and image files (paths stored relative to the folder, so it can move) (kept: re-OCR/viewing without re-downloading); VK's: `media/<VK chat id>/<owner>_<photo id>.<ext>` |
 | `tgsearch.session` | **Telethon login = full account access. Never share/commit.** |
 | `.env` | API id/hash. **Secret.** Template: `.env.example` |
 | `.gitignore` | keeps secrets (`.env`, `*.session`) and personal data (`media.db*`, `media/`) out of git |
 
 ## How it works
+
+- **VK** (`vk ARCHIVE`): VK's API gives third-party apps no access to your likes or saved photos (see Backlog),
+  so the source is its data archive: vk.com/data_protection → request a copy with "Фотографии" and/or
+  "Отметки «Мне нравится»" → a `.zip` of cp1251 HTML pages (pass it as is, or the unpacked folder). Albums
+  (`photos/photo-albums/*.html`; `-15` = saved photos) list each photo's full-size image link, date, description,
+  place. Likes (`likes/photo/likes*.html`) are bare `vk.ru/photo<owner>_<id>` links, no like date: each photo's
+  page is read for its largest size, the photo's own date, author (group/user name → sender) and description.
+  Logged out, the page embeds the photo viewer's data; with `--cookies` (a cookies.txt exported from a
+  logged-in vk.ru browser session) the ones logged-out pages don't show (closed groups, …) are retried logged in,
+  where own photos come as an embedded `photos.getById` result. Expired image links fall back to the page too.
+  Rows get `source = 'vk'` and the photo's `url`. A picture has no source, its appearances do (461 pictures are
+  in both). Each album and the likes become a "chat" ("VK: Сохранённые фото", "VK: liked photos") at chat id
+  `VK + album id` / `VK` (VK = -10^15, far below Telegram's ids; `sync`/`repair` skip them). msg ids are 1, 2, …
+  per VK chat in archive order (oldest first: they keep the like order); a VK row with the photo's url = imported
+  (reruns resume / add a newer archive's photos). A photo whose page shows nothing (VK:
+  "no access" — private, closed group, deleted) goes to `vk_hidden` and is skipped by later runs unless `--retry`
+  (e.g. with `--cookies`, or after joining a group); network/HTTP errors (proxy 503, RKN 451 →
+  `blank.php?rkn=<group>`, 424 for files VK lost) aren't remembered: the next run tries them again. Copy detection is the same as sync's,
+  so a liked photo you also saved, or a meme already seen in Telegram, is one picture with several appearances.
+  4 photos at a time (page + download + OCR); VK sends unknown user agents to `badbrowser.php`, so requests
+  present a current desktop Chrome. **The cookies file is a full login: keep it outside this folder.**
 
 - **Ingest** (`sync`): `iter_messages(filter=Photos, min_id=<max indexed msg_id>, reverse=True)` → oldest
   first, merged in message order with `filter=Document` messages whose mime is `image/*` (images sent as files;
@@ -89,7 +111,14 @@ take `YYYY-MM-DD`; `-n` limit (default 20); `--open` opens hits in Preview. Each
   texts don't conflict (`text_conflict`: overall similarity < 45, or each side has 2+ words the other lacks).
   Sync applies this on arrival (the duplicate download is deleted); `dedup` applies it to what's indexed,
   keeps the biggest copy, moves the others to the macOS Trash (NSFileManager, "Put Back" works).
-  Old-layout databases are migrated automatically on first `connect()` (backup `media.db.bak-pre-dedup`).
+- **Schema & migrations**: `media` rows carry `source` ("telegram", "vk"; set by the importer, filter `source IN`)
+  and `url` (where the appearance opens: Telegram link from `link()` at sync, vk.ru photo page); the file path is
+  only on `images`, relative to the folder (`rel()` to store, `file()` to open; an absolute one = outside the
+  folder). Chat ids stay unique across sources (albums/deleted and the chat filter key on them): a new source
+  gets its own id range. `PRAGMA user_version` = layout version (`VERSION`); `connect()` runs `migrate()` once
+  (write lock, re-checks the version, backup `media.db.bak-v<old>`, one transaction). 0 → 1 (2026-10-14): source
+  + url stored, `links` table and `media.path` gone, paths relative. The pre-dedup layout (2026-10-08) is
+  refused: upgrade it with commit 58a1b87 first.
 - **Embeddings / search by meaning**: `google/siglip2-base-patch16-256` (multilingual SigLIP 2, 768-d) via
   `transformers` on the M1 GPU (MPS, fp16). Table `emb(model, chat_id, msg_id, vec)`: unit-length float16
   vectors, **keyed by model** (and by picture, not message), so models are swappable/coexisting — `embed --model <any CLIP/SigLIP HF id>`
@@ -114,8 +143,8 @@ take `YYYY-MM-DD`; `-n` limit (default 20); `--open` opens hits in Preview. Each
   drop out as soon as a picture query is given. Exact text alone stays all-SQL (FTS rank + `snippet()`).
 - **Web UI** (`serve`): FastAPI inside `tgsearch.py` reuses `search_page()` as is. `GET /api/search` (CLI's params:
   `q, ocr, caption, meaning, similar, sender, chat, after, before, msg, album, exact, min_score, order, model`, plus
-  `page` + `limit`, `chat_id` = comma-separated ids) → `{total, hits}`, each hit with its file `size` (null =
-  missing on disk); `GET /api/chats` (names, counts and bytes in `media/<chat_id>/` for the multi-select chat
+  `page` + `limit`, `chat_id` = comma-separated ids, `source` = comma-separated sources) → `{total, hits}`, each hit
+  with its `source` and file `size` (null = missing on disk); `GET /api/chats` (names, source, counts and bytes in `media/<chat_id>/` for the multi-select chat
   filter; their sum is the "on disk" total), `/media` and `/` are static mounts (`media/`, `web/dist/`).
   Frontend searches as you type (250 ms debounce, stale requests aborted; the spinner sits in the sticky status
   line, results stay usable meanwhile). **Pages** of 60: every page is a slice of one ranking (for
@@ -129,7 +158,7 @@ take `YYYY-MM-DD`; `-n` limit (default 20); `--open` opens hits in Preview. Each
   `defaultColorScheme="auto"`; plain list layout, no custom CSS. Dev with hot reload:
   `uv run tgsearch.py serve` + `cd web && bun run dev` (Vite proxies `/api`, `/media` to :8000).
 - `chat_id` is Telethon's marked dialog id (`-100…` for channels/supergroups, positive for users).
-- **Message links** are computed at query time (SQL function `tglink`), no extra data stored:
+- **Message links** are computed at sync (`link()`) and stored as the appearance's `url`:
   channels/supergroups → `https://t.me/c/<id without -100>/<msg_id>` (official, jumps to the message; UI "Open
   message"); private chats → `tg://user?id=<id>`, which opens the **chat** (UI "Open chat"): Telegram has no
   message links in private chats — the undocumented `tg://openmessage` didn't work in the macOS app — so the
@@ -150,8 +179,8 @@ take `YYYY-MM-DD`; `-n` limit (default 20); `--open` opens hits in Preview. Each
   100 per request). Gone from Telegram → row in `deleted(chat_id, msg_id)`, the row itself stays searchable
   (UI "deleted in Telegram" badge / struck-through appearance, CLI "(deleted in Telegram)"); edited caption →
   updated; chat renamed → updated. Pictures whose file is missing on disk are downloaded again from a message
-  still there, their own message first (other appearances may be smaller copies). Missing paths outside the
-  folder (moved, see Robustness) are skipped, not recreated. Idempotent; ends with `embed`.
+  still there, their own message first (other appearances may be smaller copies). Missing files stored with an
+  absolute path outside the folder are skipped, not recreated. Idempotent; ends with `embed`.
 
 ## Decisions & gotchas
 
@@ -208,6 +237,13 @@ take `YYYY-MM-DD`; `-n` limit (default 20); `--open` opens hits in Preview. Each
 - **2026-10-09**: Combinable search: separate Text and Meaning boxes (CLI `--meaning DESCRIPTION`), both + Similar
   together; Similar clears the boxes but combines with anything typed after. `fuzzy_rank` + `semantic_rank`
   merged into `rank()`.
+- **2026-10-14**: Schema v1 (versioned migrations): `source` + `url` stored per appearance, `media.path` and
+  `links` dropped, paths relative to the folder. Migrated the real index in ~2 s (backup `media.db.bak-v0`);
+  counts, search totals per source, links and files verified identical before/after. Web UI: source badge and
+  multi-choice source filter (CLI `--source`).
+- **2026-10-14**: VK source: `vk ARCHIVE [--cookies FILE]` imports photo albums (saved photos) and liked photos
+  from VK's data archive (2026 format verified on a real one: 1,424 saved + 2,493 liked photos). Liked photos
+  resolve logged out (21 of 24 in a sample; the cookies rescued 1 of the other 3). Web UI: "Open in VK".
 - **2026-10-10**: Default sort = best match when searching (Newest when just browsing); an explicit choice wins.
 - **2026-10-10**: Fixed: UI crashed when two indexed chats share a name (group → supergroup upgrade); chat
   filter now by id. Initial git commit.
@@ -275,17 +311,14 @@ take `YYYY-MM-DD`; `-n` limit (default 20); `--open` opens hits in Preview. Each
 - Short queries (< 3 chars): fallback to `LIKE`.
 - Open hit in Telegram (deep link to message) besides Preview.
 
-**Robustness**
-- Paths are stored absolute: moving/renaming the `tgsearch` folder breaks images and the web UI (500s).
-  Store them relative to the folder (migration: strip the prefix) — do before moving it.
-
 **Portability** (e.g. run on the home server next to Immich)
 - OCR backend for Linux/Windows (candidates: RapidOCR/PaddleOCR ONNX, EasyOCR, Tesseract `rus+eng`) — benchmark
   ru/en quality against Vision on the same photos before switching; keep Vision on macOS.
-- `cuda` device in `load_model`; relative paths (see Robustness) so the folder can be copied over.
+- `cuda` device in `load_model`. (Paths are relative since 2026-10-14: the folder can be copied over.)
 
 **Sources / UI**
-- VK — researched 2026-10-10 (details below); next step needs the user's own data archive. Local folders.
+- VK: done for photo albums + liked photos (`vk`). Next: photos in liked wall posts (`likes/wall` = post links),
+  chats (archive `messages/`, direct attachment links), group walls (`wall.get` + service key). Local folders.
 
 **VK source: research (2026-10-10)**
 - **User tokens**: Implicit / Authorization Code Flow switched off 2024-06-25; new apps only via VK ID (OAuth 2.1 +
@@ -304,8 +337,14 @@ take `YYYY-MM-DD`; `-n` limit (default 20); `--open` opens hits in Preview. Each
   pages with direct image URLs + dates, `messages/` = chat pages with direct photo attachment URLs (no login
   needed), `likes/photo` = `vk.com/photo…` links only (resolved via the page's og:image with browser cookies,
   e.g. VKArchiveDownloader). Encoding cp1251. Structure must be re-checked on a 2026 archive.
-- **Schema prerequisite**: a `source` (telegram/vk) next to chat/msg ids — ids collide across sources; links
-  stop being `tglink()`-derived; `images.photo_id` must not mix id spaces.
+- **Schema** (done 2026-10-14): `source` + `url` per appearance, VK chats at reserved ids, `images.photo_id`
+  stays Telegram-only (VK copies are caught by pHash).
+- **Later, for more sources**: a `chats` table (source, the source's own id, name) with internal ids, instead of
+  per-source id ranges, and `media/<source>/<chat>/` folders; items holding several pictures (a VK post or
+  message with up to 10 photos: one id, several appearances) need an attachment index in the key or synthetic ids
+  + album grouping, as `vk` does now.
+- **"User bot" via the official app's identity** (what VTosters/Kate did): rejected — impersonates VK's client,
+  against its rules, actively blocked (Kate Mobile 2026-09), risks the account. Archive + pages instead.
 - Web UI auth (login/password or token) — required before binding `serve` to anything but 127.0.0.1.
 - Web UI: lightbox instead of opening the image in a new tab, collapsible filters on phones,
   sync trigger/progress from the UI.
