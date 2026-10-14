@@ -27,7 +27,8 @@ import {
 } from "@mantine/core";
 import { useDebouncedValue } from "@mantine/hooks";
 import { Notifications, notifications } from "@mantine/notifications";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
 
 type Appearance = { date: string; chat: string; sender: string; link: string; msg_id: number; deleted: boolean };
@@ -91,6 +92,7 @@ const toQuery = (f: Filters) =>
       .filter(([k, v]) => v !== "" && v !== EMPTY[k as keyof Filters])
       .map(([k, v]) => [k, String(v)]),
   ).toString();
+const href = (f: Filters) => (toQuery(f) ? `?${toQuery(f)}` : location.pathname);
 function fromUrl(): Filters {
   const f: Record<string, unknown> = { ...EMPTY };
   new URLSearchParams(location.search).forEach((v, k) => {
@@ -293,25 +295,25 @@ function App() {
   const [models, setModels] = useState<Model[]>([]);
   const [similarTo, setSimilarTo] = useState<Hit | null>(null);
   const [tags, setTags] = useState<Record<number, string[]>>({});
+  const restoreY = useRef(0); // scroll position to return to once a back/forward step's results are in
   const pages = Math.ceil(total / PAGE);
-  const set = <K extends keyof Filters>(key: K, value: Filters[K]) =>
-    setFilters({
-      ...filters,
-      [key]: value,
-      page: key === "page" ? (value as number) : 1, // any other change starts over at page 1
-    });
-  const searchTag = (tag: string) => {
-    setFilters({ ...filters, meaning: tag, page: 1 });
+  // typing/filters change the current history entry and start over at page 1
+  const set = <K extends keyof Filters>(key: K, value: Filters[K]) => setFilters({ ...filters, [key]: value, page: 1 });
+  // another page, an album, look-alikes, a tag: a history step, so back returns to this search, page and scroll position.
+  // state.trip = steps back to where the album/look-alikes were opened, for their close buttons
+  const go = (next: Filters, trip = false) => {
+    history.replaceState({ ...history.state, y: scrollY }, "", href(filters)); // incl. typing not debounced yet
+    history.pushState(trip ? { trip: 1 } : history.state?.trip ? { trip: history.state.trip + 1 } : null, "", href(next));
+    setFilters(next);
     window.scrollTo({ top: 0 });
   };
-  const openAlbum = (hit: Hit) => {
-    setFilters({ ...filters, album: `${hit.chat_id}:${hit.msg_id}`, ocr: "", caption: "", meaning: "", msg: "", similar: "", page: 1 });
-    window.scrollTo({ top: 0 });
-  };
+  const close = (key: "album" | "similar") => (history.state?.trip ? history.go(-history.state.trip) : set(key, ""));
+  const searchTag = (tag: string) => go({ ...filters, meaning: tag, page: 1 });
+  const openAlbum = (hit: Hit) =>
+    go({ ...filters, album: `${hit.chat_id}:${hit.msg_id}`, ocr: "", caption: "", meaning: "", msg: "", similar: "", page: 1 }, true);
   const findSimilar = (hit: Hit) => {
     setSimilarTo(hit); // starts from scratch; text/meaning typed afterwards narrow it down
-    setFilters({ ...filters, similar: String(hit.image_id), ocr: "", caption: "", meaning: "", album: "", page: 1 });
-    window.scrollTo({ top: 0 });
+    go({ ...filters, similar: String(hit.image_id), ocr: "", caption: "", meaning: "", album: "", page: 1 }, true);
   };
 
   useEffect(() => {
@@ -323,25 +325,30 @@ function App() {
   }, []);
 
   useEffect(() => {
-    const back = () => setFilters(fromUrl()); // browser back/forward: restore that search
+    history.scrollRestoration = "manual"; // the old results are still shown at popstate; restored once the new ones load
+    const back = () => {
+      // browser back/forward: restore that search, then where it was scrolled to
+      restoreY.current = history.state?.y ?? 0;
+      setFilters(fromUrl());
+    };
     window.addEventListener("popstate", back);
     return () => window.removeEventListener("popstate", back);
   }, []);
 
   useEffect(() => {
-    const query = toQuery(debounced);
-    if (query !== location.search.slice(1)) {
-      // a new page is a history step (back = previous page); typing just updates the current entry
-      const paged = String(debounced.page) !== (new URLSearchParams(location.search).get("page") ?? "1");
-      history[paged ? "pushState" : "replaceState"](null, "", query ? `?${query}` : location.pathname);
-    }
+    if (toQuery(debounced) !== location.search.slice(1)) history.replaceState(history.state, "", href(debounced));
+    const y = restoreY.current;
+    restoreY.current = 0;
     const ctl = new AbortController();
     setLoading(true);
     fetch(`/api/search?${toQuery({ ...debounced, order: orderOf(debounced) })}&limit=${PAGE}`, { signal: ctl.signal })
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error(r.statusText))))
       .then((r: { total: number; hits: Hit[] }) => {
-        setHits(r.hits);
-        setTotal(r.total);
+        flushSync(() => {
+          setHits(r.hits);
+          setTotal(r.total);
+        });
+        if (y) window.scrollTo({ top: y }); // rendered by now
       })
       .catch((e) => e.name !== "AbortError" && fail(`Search failed: ${e.message}`))
       .finally(() => !ctl.signal.aborted && setLoading(false));
@@ -493,7 +500,7 @@ function App() {
             <Text size="sm">
               Album{hits?.length ? ` of ${total} photos · ${hits[0].date} · ${hits[0].chat}` : ""}
             </Text>
-            <CloseButton size="sm" aria-label="Close album" onClick={() => set("album", "")} />
+            <CloseButton size="sm" aria-label="Close album" onClick={() => close("album")} />
           </Group>
         )}
         {filters.similar && (
@@ -504,7 +511,7 @@ function App() {
                 ? `the photo from ${similarTo.date} · ${similarTo.chat}`
                 : `picture #${filters.similar}`}
             </Text>
-            <CloseButton size="sm" aria-label="Clear" onClick={() => set("similar", "")} />
+            <CloseButton size="sm" aria-label="Clear" onClick={() => close("similar")} />
           </Group>
         )}
         {/* status line: in the sticky header so the spinner shows wherever the page is scrolled; results stay usable */}
@@ -549,10 +556,7 @@ function App() {
             siblings={1}
             size="sm"
             gap={4} // one line at phone width even mid-range: ‹ 1 … 149 150 151 … 303 ›
-            onChange={(p) => {
-              set("page", p);
-              window.scrollTo({ top: 0 });
-            }}
+            onChange={(p) => go({ ...filters, page: p })}
           />
         </Group>
       )}
