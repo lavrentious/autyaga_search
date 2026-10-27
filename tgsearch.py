@@ -30,6 +30,7 @@ import sqlite3
 import subprocess
 import threading
 import time
+import unicodedata
 import urllib.request
 import zipfile
 from collections import deque
@@ -51,6 +52,19 @@ DUP_HASH_BITS = 6  # pHash distance for duplicate *candidates*; same_picture() d
 
 def norm(s):
     return (s or "").replace("ё", "е").replace("Ё", "Е")
+
+
+# Latin letters -> their base letter, one char for one (match offsets stay valid in the original): à á ä å ą -> a,
+# İ -> I (whose lower() is 2 chars); ł ø đ… have no accent to strip, so they're listed. Cyrillic stays (й is not и).
+# The index folds the same for exact search (remove_diacritics), minus the listed ones; web/main.tsx fold() mirrors it.
+FOLD = {c: d[0] for c in map(chr, range(0xC0, 0x2000)) if len(d := unicodedata.normalize("NFD", c)) > 1
+        and d[0].isascii() and d[0].isalpha()} | dict(zip("łŁøØđĐħĦıŧŦ", "lLoOdDhHitT"))
+ACCENTED = re.compile(f"[{''.join(FOLD)}]")  # touches only these: str.translate was 14x slower on Cyrillic
+
+
+def fold(s):
+    """What fuzzy search compares: lowercase, no accents on Latin letters ("Stąd" -> "stad"); as long as s."""
+    return ACCENTED.sub(lambda m: FOLD[m[0]], s).lower()
 
 
 # Sources: "telegram" (sync), "vk" (vk_import); each appearance stores its own (media.source). Chat ids stay unique
@@ -91,8 +105,11 @@ COL_OF = {"ocr": 5, "caption": 6}  # ...and of the searchable texts
 # (a message, a VK album or likes slot) is a `media` row pointing at it: source, chat/msg ids, where it opens
 # (url), its own caption/sender and a copy of the OCR text, so FTS searches appearances directly.
 # images.photo_id is Telegram's photo or document id (an image sent as a file): both random 64-bit, no clashes.
+# The trigram index ignores case and accents on Latin letters ("stad" finds "stąd").
+# ponytail: letters with no accent to strip (ł ø đ) stay themselves for exact search; fuzzy folds them (FOLD)
 MEDIA = """CREATE VIRTUAL TABLE IF NOT EXISTS media USING fts5(ocr, caption, sender, chat, source UNINDEXED,
-    chat_id UNINDEXED, msg_id UNINDEXED, date UNINDEXED, url UNINDEXED, image UNINDEXED, tokenize='trigram')"""
+    chat_id UNINDEXED, msg_id UNINDEXED, date UNINDEXED, url UNINDEXED, image UNINDEXED,
+    tokenize='trigram remove_diacritics 1')"""
 SCHEMA = [
     "CREATE TABLE IF NOT EXISTS images (id INTEGER PRIMARY KEY, path TEXT, phash TEXT, photo_id INTEGER UNIQUE)",
     MEDIA,
@@ -110,7 +127,7 @@ SCHEMA = [
     "CREATE TABLE IF NOT EXISTS vk_hidden (url TEXT PRIMARY KEY)",
 ]
 # PRAGMA user_version of the layout above. A change to it gets a migration below and this +1.
-VERSION = 1
+VERSION = 2
 
 
 def connect(path=HERE / "media.db"):
@@ -136,21 +153,29 @@ def migrate(db, path, version):
             db.backup(bak)  # unlike a file copy, includes anything still in the WAL file
         print(f"upgrading the index to version {VERSION} (backup: {path}.bak-v{version})")
     db.execute("BEGIN IMMEDIATE")  # holds off other writers: another process may have just upgraded it
-    if db.execute("PRAGMA user_version").fetchone()[0] >= VERSION:
+    if (version := db.execute("PRAGMA user_version").fetchone()[0]) >= VERSION:
         return db.rollback()
-    # 0 -> 1 (2026-10-14): appearances store their source and url (were: the chat id's range; a `links` table for
-    # VK, Telegram links computed per query); the file path lives on the picture only, relative to this folder
-    db.create_function("tglink", 2, link, deterministic=True)
-    db.execute("ALTER TABLE media RENAME TO media_v0")
-    db.execute("CREATE TABLE IF NOT EXISTS links (chat_id INTEGER, msg_id INTEGER, url TEXT, PRIMARY KEY (chat_id, msg_id))")
-    db.execute(MEDIA)
-    db.execute("""INSERT INTO media SELECT ocr, caption, sender, chat, CASE WHEN chat_id < ? THEN 'vk' ELSE 'telegram' END,
-        chat_id, msg_id, date, coalesce((SELECT url FROM links l WHERE l.chat_id = m.chat_id AND l.msg_id = m.msg_id),
-        tglink(chat_id, msg_id)), image FROM media_v0 m""", (VK // 10,))
-    db.execute("DROP TABLE media_v0")
-    db.execute("DROP TABLE links")
-    here = f"{HERE}/"
-    db.execute("UPDATE images SET path = substr(path, ?) WHERE substr(path, 1, ?) = ?", (len(here) + 1, len(here), here))
+    if version < 1:
+        # 0 -> 1 (2026-10-14): appearances store their source and url (were: the chat id's range; a `links` table for
+        # VK, Telegram links computed per query); the file path lives on the picture only, relative to this folder
+        db.create_function("tglink", 2, link, deterministic=True)
+        db.execute("ALTER TABLE media RENAME TO media_v0")
+        db.execute("CREATE TABLE IF NOT EXISTS links (chat_id INTEGER, msg_id INTEGER, url TEXT, PRIMARY KEY (chat_id, msg_id))")
+        db.execute(MEDIA)
+        db.execute("""INSERT INTO media SELECT ocr, caption, sender, chat, CASE WHEN chat_id < ? THEN 'vk' ELSE 'telegram' END,
+            chat_id, msg_id, date, coalesce((SELECT url FROM links l WHERE l.chat_id = m.chat_id AND l.msg_id = m.msg_id),
+            tglink(chat_id, msg_id)), image FROM media_v0 m""", (VK // 10,))
+        db.execute("DROP TABLE media_v0")
+        db.execute("DROP TABLE links")
+        here = f"{HERE}/"
+        db.execute("UPDATE images SET path = substr(path, ?) WHERE substr(path, 1, ?) = ?", (len(here) + 1, len(here), here))
+    if version < 2:
+        # 1 -> 2 (2026-10-27): exact search ignores accents (trigram remove_diacritics); a tokenizer can't be changed,
+        # so the index is rebuilt
+        db.execute("ALTER TABLE media RENAME TO media_v1")
+        db.execute(MEDIA)
+        db.execute("INSERT INTO media SELECT * FROM media_v1")
+        db.execute("DROP TABLE media_v1")
     db.execute(f"PRAGMA user_version = {VERSION}")
     db.commit()
 
@@ -275,11 +300,11 @@ def rank(db, where, params, said, min_score, model, meaning, similar, limit, off
         return [], 0
     keep, rel, shown = set(range(len(rows))), np.zeros(len(rows)), []
     for query, cols in said:  # each text query must match (fuzzy: score >= min_score); scores add up
-        q = norm(query).lower()
+        q = fold(norm(query))
         # partial_ratio searches the shorter string inside the longer one, so a doc shorter than the query
         # (e.g. "" for a textless image) would "contain itself" in the query and score 100. Padding with \0
         # (matches nothing) keeps the query as the needle.
-        docs = {c: [(r[COL_OF[c]] or "").lower().ljust(len(q), "\0") for r in rows] for c in cols}
+        docs = {c: [fold(r[COL_OF[c]] or "").ljust(len(q), "\0") for r in rows] for c in cols}
         scores = {}
         if min_score is not None:
             # ponytail: scans every row passing the other filters (fine for ~100k); prefilter with a trigram OR-query if slow
@@ -318,7 +343,8 @@ def rank(db, where, params, said, min_score, model, meaning, similar, limit, off
         for q, cols, docs, scores in shown:
             a, c = max(((fuzz.partial_ratio_alignment(q, docs[c][i]), c) for c in cols), key=lambda x: x[0].score)
             t, s, e = rows[i][COL_OF[c]] or "", a.dest_start, a.dest_end
-            snip.append(f"…{t[max(0, s - 40):s]}\x1b[1m{t[s:e]}\x1b[0m{t[e:e + 40]}…" +
+            cut = "…" * (s > 40), "…" * (len(t) > e + 40)  # only where the text goes on
+            snip.append(f"{cut[0]}{t[max(0, s - 40):s]}\x1b[1m{t[s:e]}\x1b[0m{t[e:e + 40]}{cut[1]}" +
                         (f" ({scores[i]:.0f}%)" if i in scores else ""))
         snip += [f"{sims[i, j]:.3f} {label}" for j, label in enumerate(queries)]
         out.append((*rows[i], " · ".join(snip)))

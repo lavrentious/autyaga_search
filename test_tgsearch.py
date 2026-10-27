@@ -76,6 +76,21 @@ two = search(db, ocr="свекло", caption="борщ", min_score=80)[0][-1]
 assert "\x1b[1mСвекл\x1b[0m" in two and "\x1b[1mборщ\x1b[0m" in two, two  # a highlight per query
 assert "\x1b[1mПароль от WiFi\x1b[0m" in search(db, text="пороль от wifi", min_score=80)[0][-1]  # match highlighted
 
+# accents on Latin letters don't matter, in the text or the query, exact or fuzzy; Cyrillic keeps its letters
+pl = connect(":memory:")
+add(pl, 1, "c", 1, "2025-01-01 10:00", "s", None, "Nie wiem, stąd idę. Łódź", "/pl.jpg")
+add(pl, 1, "c", 2, "2025-01-02 10:00", "s", None, "Café à la carte", "/fr.jpg")
+add(pl, 1, "c", 3, "2025-01-03 10:00", "s", None, "мой дом", "/ru.jpg")
+add(pl, 1, "c", 4, "2025-01-04 10:00", "s", None, "x" * 50 + " zebra " + "y" * 50, "/long.jpg")
+for kw in ({}, {"min_score": 80}):
+    assert [r[3] for r in search(pl, text="STAD", **kw)] == ["/pl.jpg"]
+    assert [r[3] for r in search(pl, text="cafe a la", **kw)] == [r[3] for r in search(pl, text="cafè", **kw)] == ["/fr.jpg"]
+assert search(pl, text="мои дом") == []  # й is a letter of its own
+assert [r[3] for r in search(pl, text="lodz", min_score=80)] == ["/pl.jpg"]  # ł: no accent to strip, fuzzy only
+# the original letters marked; "…" only where the text goes on
+assert search(pl, text="lodz", min_score=80)[0][-1] == "Nie wiem, stąd idę. \x1b[1mŁódź\x1b[0m (100%)"
+assert search(pl, text="zebra", min_score=80)[0][-1] == f"…{'x' * 39} \x1b[1mzebra\x1b[0m {'y' * 39}… (100%)"
+
 # message links, appearances
 assert search(db, text="встреча")[0][4] == "https://t.me/c/1234567890/2"  # supergroup/channel
 assert search(db, text="борщ", min_score=80)[0][4] == "tg://user?id=42"  # private chat: no message links, open chat
@@ -238,6 +253,22 @@ with tempfile.TemporaryDirectory() as d:
     assert [r[3] for r in search(new, text="текст")] == ["media/42/7.jpg"] and search(new, sources=["vk"])[0][4].startswith("https://vk")
     new.close()
     assert connect(f"{d}/old.db").execute("SELECT count(*) FROM media").fetchone() == (3,)  # opened again: no rerun
+
+    # migration 1 -> 2: the index is rebuilt to ignore accents
+    old = sqlite3.connect(f"{d}/v1.db")
+    old.execute("CREATE TABLE images (id INTEGER PRIMARY KEY, path TEXT, phash TEXT, photo_id INTEGER UNIQUE)")
+    old.execute(tgsearch.MEDIA.replace(" remove_diacritics 1", ""))
+    old.execute("INSERT INTO images (path) VALUES ('media/1/1.jpg')")
+    old.execute("INSERT INTO media VALUES ('stąd', '', 'Вася', 'Чат', 'telegram', 1, 1, '2024-01-01 00:00', 'tg://user?id=1', 1)")
+    old.execute("PRAGMA user_version = 1")
+    old.commit()
+    assert not old.execute("SELECT 1 FROM media WHERE media MATCH 'stad'").fetchall()
+    old.close()
+    new = connect(f"{d}/v1.db")
+    assert new.execute("PRAGMA user_version").fetchone() == (tgsearch.VERSION,) and Path(f"{d}/v1.db.bak-v1").exists()
+    assert [r[3] for r in search(new, text="stad", sender="вася")] == ["media/1/1.jpg"]
+    assert not new.execute("SELECT 1 FROM sqlite_master WHERE name = 'media_v1'").fetchall()
+    new.close()
     try:  # pre-dedup layout: refused, not mangled
         pre = sqlite3.connect(f"{d}/pre.db")
         pre.execute("CREATE VIRTUAL TABLE media USING fts5(ocr, chat_id UNINDEXED, path UNINDEXED)")

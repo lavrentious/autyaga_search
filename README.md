@@ -92,13 +92,16 @@ take `YYYY-MM-DD`; `-n` limit (default 20); `--open` opens hits in Preview. Each
 - **OCR**: `ocrmac` → Apple Vision, `accurate` mode, `["ru-RU", "en-US"]` (Russian is unavailable in `fast`
   mode). Recognized lines joined with spaces so phrases can match across line breaks. OCR failure on one
   image stores empty text instead of blocking resume.
-- **Index**: one FTS5 table, `tokenize='trigram'` → case-insensitive substring search (Cyrillic included),
-  tolerant to word endings/OCR noise. Columns: `ocr, caption, sender, chat` (indexed) +
-  `chat_id, msg_id, date, path` (UNINDEXED). `ё` is normalized to `е` on insert and query.
+- **Index**: one FTS5 table, `tokenize='trigram remove_diacritics 1'` → case-insensitive substring search
+  (Cyrillic included), tolerant to word endings/OCR noise; accents on Latin letters don't matter ("stad" finds
+  "stąd", "cafè" finds "café"), Cyrillic keeps its letters (й ≠ и). Columns: `ocr, caption, sender, chat`
+  (indexed) + `chat_id, msg_id, date, path` (UNINDEXED). `ё` is normalized to `е` on insert and query.
   Dates stored as local time `YYYY-MM-DD HH:MM` (string compare works for ranges).
 - **Fuzzy search**: SQL applies the non-text filters, then `rapidfuzz` `partial_ratio` (best-matching window
   of the query inside OCR+caption, Levenshtein-based) scores every remaining row; matched span is highlighted.
-  Linear scan: ~0.1 s on 2.3k rows. Queries ≤ 4 chars are effectively exact at the default 80.
+  Both sides go through `fold()` first: lowercase, accents off Latin letters, plus ł ø đ ı → l o d i (no accent
+  to strip, so the index can't fold those: exact "zostal" misses "ZOSTAŁ", fuzzy finds it). One char for one,
+  so the match's offsets mark the original text. Linear scan: ~0.1 s on 2.3k rows, ~0.3 s on 28k. Queries ≤ 4 chars are effectively exact at the default 80.
   Gotcha (fixed): `partial_ratio` searches the *shorter* string in the longer, so textless images (doc `" "`)
   scored 100% for any query with a space → docs are padded with `\0` to the query length.
 - **Pictures vs appearances (dedup)**: a picture is stored, fingerprinted and embedded once (`images`: path,
@@ -153,7 +156,8 @@ take `YYYY-MM-DD`; `-n` limit (default 20); `--open` opens hits in Preview. Each
   query); a page change is a history step (Back = previous page), typing replaces the entry. After a reload the
   Similar banner only knows the id ("picture #N"); the album banner is derived from the results. Matches highlighted by
   splitting the snippet on the CLI's ANSI bold codes (no HTML injection). Each hit: highlighted snippet, then
-  caption + full OCR text behind "Show full text" (Mantine `Spoiler`, query words highlighted); without a query
+  caption + full OCR text behind "Show full text" (Mantine `Spoiler`, the query marked the way search matches:
+  ignoring case and accents, `fold()` in `main.tsx` mirrors the server's); without a query
   the first lines are shown. UI kit: Mantine (`@mantine/core`, `hooks`, `notifications`), default theme,
   `defaultColorScheme="auto"`; plain list layout, no custom CSS. Dev with hot reload:
   `uv run tgsearch.py serve` + `cd web && bun run dev` (Vite proxies `/api`, `/media` to :8000).
@@ -255,6 +259,10 @@ take `YYYY-MM-DD`; `-n` limit (default 20); `--open` opens hits in Preview. Each
 - **2026-10-14**: VK source: `vk ARCHIVE [--cookies FILE]` imports photo albums (saved photos) and liked photos
   from VK's data archive (2026 format verified on a real one: 1,424 saved + 2,493 liked photos). Liked photos
   resolve logged out (21 of 24 in a sample; the cookies rescued 1 of the other 3). Web UI: "Open in VK".
+- **2026-10-27**: Schema v2: search ignores accents on Latin letters, exact (index rebuilt with
+  `remove_diacritics`) and fuzzy (`fold()`, also ł ø đ); the web UI's full-text highlight too. Upgrade tried
+  on a copy of the real index: ~10 s, "stad" now finds "Stąd żydy wyszli" both ways, fuzzy "zostal" finds
+  "ZOSTAŁ"; fuzzy search 0.23 → 0.32 s. Fixed: fuzzy snippets had "…" on both ends even at the text's start/end.
 - **2026-10-10**: Default sort = best match when searching (Newest when just browsing); an explicit choice wins.
 - **2026-10-10**: Fixed: UI crashed when two indexed chats share a name (group → supergroup upgrade); chat
   filter now by id. Initial git commit.

@@ -11,7 +11,6 @@ import {
   Container,
   Divider,
   Group,
-  Highlight,
   Image,
   Loader,
   MantineProvider,
@@ -24,10 +23,11 @@ import {
   Stack,
   Text,
   TextInput,
+  type TextProps,
 } from "@mantine/core";
 import { useDebouncedValue } from "@mantine/hooks";
 import { Notifications, notifications } from "@mantine/notifications";
-import { useEffect, useRef, useState } from "react";
+import { type ReactNode, useEffect, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
 
@@ -136,6 +136,32 @@ function copyImage(url: string) {
   return navigator.clipboard.write([new ClipboardItem({ "image/png": png })]);
 }
 
+// what search ignores, one UTF-16 unit for one (so a match's offsets hold in the original): case, accents on Latin
+// letters ("Stąd" -> "stad"; İ lowercases to 2 units), the strokes of ł ø đ…, ё vs е. Mirrors fold() + norm() in tgsearch.py
+const SAME: Record<string, string> = { ł: "l", ø: "o", đ: "d", ħ: "h", ı: "i", ŧ: "t", ё: "е" };
+function fold(s: string) {
+  let out = "";
+  for (const c of s.split("")) {
+    const low = c.toLowerCase(), base = low.normalize("NFD")[0];
+    out += /[a-z]/.test(base) ? base : (SAME[low] ?? (low.length === 1 ? low : c));
+  }
+  return out;
+}
+
+// `text` with every occurrence of `query` marked, matched the way search matches
+function Marked({ text, query, ...props }: TextProps & { text: string; query: string }) {
+  const q = fold(query.trim()), parts: ReactNode[] = [];
+  let at = 0;
+  if (q) {
+    const t = fold(text);
+    for (let i = t.indexOf(q); i >= 0; i = t.indexOf(q, at)) {
+      parts.push(text.slice(at, i), <Mark key={i}>{text.slice(i, (at = i + q.length))}</Mark>);
+    }
+  }
+  parts.push(text.slice(at));
+  return <Text {...props}>{parts}</Text>;
+}
+
 function Result({
   hit,
   ocrQuery,
@@ -228,16 +254,8 @@ function Result({
             styles={{ control: { fontSize: "var(--mantine-font-size-sm)" } }}
           >
             <Stack gap={4} style={{ overflowWrap: "anywhere" }}>
-              {hit.caption && (
-                <Highlight highlight={captionQuery} size="sm">
-                  {hit.caption}
-                </Highlight>
-              )}
-              {hit.ocr && (
-                <Highlight highlight={ocrQuery} size="sm" c="dimmed">
-                  {hit.ocr}
-                </Highlight>
-              )}
+              {hit.caption && <Marked text={hit.caption} query={captionQuery} size="sm" />}
+              {hit.ocr && <Marked text={hit.ocr} query={ocrQuery} size="sm" c="dimmed" />}
             </Stack>
           </Spoiler>
         )}
