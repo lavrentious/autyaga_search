@@ -158,6 +158,31 @@ assert "\x1b[1mВстреча\x1b[0m" in hit and "(100%)" in hit and hit.endswit
 both = search(db, meaning="x", similar=2, model="fake", order="relevance")
 assert [r[3] for r in both][0] == "/c.jpg" and "similarity to #2" in both[0][-1], both
 
+# look-alikes of a picture that isn't indexed (CLI file, web upload): its vector comes from the file
+with tempfile.TemporaryDirectory() as d:
+    here, tgsearch.HERE = tgsearch.HERE, Path(d)
+    seen = []
+    tgsearch.encode = lambda name, images=None, text=None: (
+        seen.append(images[0].size) or vec(0, 1, 0)[None] if images else vec(1, 0, 0)[None])  # picture like #2's
+    buf = io.BytesIO()
+    Image.new("RGBA", (3000, 1000)).save(buf, "PNG")
+    qid = tgsearch.save_query(buf.getvalue())
+    assert tgsearch.save_query(buf.getvalue()) == qid  # same picture, same id: its search URL keeps working
+    query = f"{d}/queries/{qid}.jpg"
+    assert Image.open(query).size == (1024, 341)  # the model sees 256 px
+    like = search(db, similar=query, model="fake", order="relevance")
+    assert [r[3] for r in like] == ["/b.jpg", "/c.jpg", "/a.jpg"] and like[0][-1] == f"1.000 similarity to {qid}.jpg"
+    assert paths(similar=query, model="fake", offset=1, limit=1, order="relevance") == ["/c.jpg"]
+    assert seen == [(1024, 341)]  # encoded once, then cached (the web UI repeats a search per keystroke/page)
+    assert paths(similar=query, meaning="x", model="fake", order="relevance")[0] == "/c.jpg"  # combines as #2 does
+    try:
+        tgsearch.save_query(b"not an image")
+        raise AssertionError("saved a non-image")
+    except ValueError:
+        pass
+    assert sorted(p.name for p in Path(d, "queries").iterdir()) == [f"{qid}.jpg"]
+    tgsearch.HERE = here
+
 with tempfile.TemporaryDirectory() as d:
     # embed: once per picture, only those missing vectors for that model; unreadable files skipped
     calls = []

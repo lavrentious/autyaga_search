@@ -10,6 +10,7 @@ import {
   CloseButton,
   Container,
   Divider,
+  FileButton,
   Group,
   Image,
   Loader,
@@ -17,6 +18,7 @@ import {
   Mark,
   MultiSelect,
   NumberInput,
+  Overlay,
   Pagination,
   Select,
   Spoiler,
@@ -71,6 +73,7 @@ const EMPTY = {
   meaning: "", // description of what's in the picture (embeddings); text boxes then only filter
   model: "", // embedding model; empty = server default
   similar: "", // image id of a picture to find look-alikes of
+  like: "", // id of an uploaded picture (queries/<id>.jpg) to find look-alikes of
   msg: "", // exact message id
   album: "", // "chat_id:msg_id": show that message's whole album
   order: "", // new / old: by message date; relevance: best match first; "" = relevance when searching, else new
@@ -83,7 +86,7 @@ const NO_IMAGE = // shown for messages whose photo is gone (e.g. expired self-de
       '<text x="70" y="74" font-family="sans-serif" font-size="12" fill="#888" text-anchor="middle">no image</text></svg>',
   );
 type Filters = typeof EMPTY;
-const orderOf = (f: Filters) => f.order || (f.ocr || f.caption || f.meaning || f.similar ? "relevance" : "new");
+const orderOf = (f: Filters) => f.order || (f.ocr || f.caption || f.meaning || f.similar || f.like ? "relevance" : "new");
 
 // filters <-> query string, non-defaults only: it's both the page URL (shareable, survives reload/back) and the API query
 const toQuery = (f: Filters) =>
@@ -103,6 +106,8 @@ function fromUrl(): Filters {
 }
 
 const fail = (message: string) => notifications.show({ color: "red", message });
+// a failed API call's reason: FastAPI's `detail`, else the status
+const failure = async (r: Response) => new Error((await r.json().catch(() => null))?.detail ?? r.statusText);
 // decimal units, like Finder
 const fmtSize = (b: number) =>
   b < 1e6 ? `${Math.round(b / 1e3)} KB` : b < 1e9 ? `${(b / 1e6).toFixed(1)} MB` : `${(b / 1e9).toFixed(2)} GB`;
@@ -313,6 +318,7 @@ function App() {
   const [models, setModels] = useState<Model[]>([]);
   const [similarTo, setSimilarTo] = useState<Hit | null>(null);
   const [tags, setTags] = useState<Record<number, string[]>>({});
+  const [dragging, setDragging] = useState(false); // an image dragged over the page: drop it to search by it
   const restoreY = useRef(0); // scroll position to return to once a back/forward step's results are in
   const pages = Math.ceil(total / PAGE);
   // typing/filters change the current history entry and start over at page 1
@@ -325,14 +331,28 @@ function App() {
     setFilters(next);
     window.scrollTo({ top: 0 });
   };
-  const close = (key: "album" | "similar") => (history.state?.trip ? history.go(-history.state.trip) : set(key, ""));
+  const close = (key: "album" | "similar" | "like") => (history.state?.trip ? history.go(-history.state.trip) : set(key, ""));
   const searchTag = (tag: string) => go({ ...filters, meaning: tag, page: 1 });
   const openAlbum = (hit: Hit) =>
-    go({ ...filters, album: `${hit.chat_id}:${hit.msg_id}`, ocr: "", caption: "", meaning: "", msg: "", similar: "", page: 1 }, true);
+    go({ ...filters, album: `${hit.chat_id}:${hit.msg_id}`, ocr: "", caption: "", meaning: "", msg: "", similar: "", like: "", page: 1 }, true);
   const findSimilar = (hit: Hit) => {
     setSimilarTo(hit); // starts from scratch; text/meaning typed afterwards narrow it down
-    go({ ...filters, similar: String(hit.image_id), ocr: "", caption: "", meaning: "", album: "", page: 1 }, true);
+    go({ ...filters, similar: String(hit.image_id), like: "", ocr: "", caption: "", meaning: "", album: "", page: 1 }, true);
   };
+  // look-alikes of a picture of one's own (button, paste, drop): kept on the server, so the URL holds the search
+  const findLike = (file: Blob) => {
+    setLoading(true);
+    fetch("/api/query-image", { method: "POST", body: file })
+      .then((r) => (r.ok ? r.json() : failure(r).then((e) => Promise.reject(e))))
+      .then(({ id }: { id: string }) =>
+        go({ ...filters, like: id, similar: "", ocr: "", caption: "", meaning: "", album: "", page: 1 }, true),
+      )
+      .catch((e) => {
+        setLoading(false);
+        fail(`Couldn't search by that image: ${e.message}`);
+      });
+  };
+  const imageOf = (data: DataTransfer | null) => [...(data?.files ?? [])].find((f) => f.type.startsWith("image/"));
 
   useEffect(() => {
     for (const [url, setter] of [["/api/chats", setChats], ["/api/models", setModels]] as const)
@@ -341,6 +361,24 @@ function App() {
         .then(setter)
         .catch(() => fail(`Couldn't load ${url}`));
   }, []);
+
+  useEffect(() => {
+    if (!models.length) return; // nothing embedded: no picture search
+    const paste = (e: ClipboardEvent) => {
+      const image = imageOf(e.clipboardData); // a screenshot, "Copy image", a file copied in Finder
+      if (image) {
+        e.preventDefault();
+        findLike(image);
+      }
+    };
+    const enter = (e: DragEvent) => e.dataTransfer?.types.includes("Files") && setDragging(true);
+    window.addEventListener("paste", paste);
+    window.addEventListener("dragenter", enter);
+    return () => {
+      window.removeEventListener("paste", paste);
+      window.removeEventListener("dragenter", enter);
+    };
+  });
 
   useEffect(() => {
     history.scrollRestoration = "manual"; // the old results are still shown at popstate; restored once the new ones load
@@ -360,7 +398,7 @@ function App() {
     const ctl = new AbortController();
     setLoading(true);
     fetch(`/api/search?${toQuery({ ...debounced, order: orderOf(debounced) })}&limit=${PAGE}`, { signal: ctl.signal })
-      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(r.statusText))))
+      .then((r) => (r.ok ? r.json() : failure(r).then((e) => Promise.reject(e))))
       .then((r: { total: number; hits: Hit[] }) => {
         flushSync(() => {
           setHits(r.hits);
@@ -386,6 +424,28 @@ function App() {
 
   return (
     <Container size="md" pb="xl">
+      {dragging && (
+        <Overlay
+          fixed
+          center
+          zIndex={1000}
+          blur={2}
+          onDragOver={(e) => e.preventDefault()} // allows the drop
+          onDragLeave={() => setDragging(false)}
+          onClick={() => setDragging(false)} // in case a cancelled drag left it up
+          onDrop={(e) => {
+            e.preventDefault(); // not the browser opening the file
+            setDragging(false);
+            const image = imageOf(e.dataTransfer);
+            if (image) findLike(image);
+            else fail("That's not an image");
+          }}
+        >
+          <Text c="white" size="xl" fw={500} style={{ pointerEvents: "none" }}>
+            Drop an image to find pictures like it
+          </Text>
+        </Overlay>
+      )}
       <Box pos="sticky" top={0} py="sm" bg="var(--mantine-color-body)" style={{ zIndex: 1 }}>
         <Group gap="xs">
           <TextInput
@@ -411,6 +471,15 @@ function App() {
               value={filters.meaning}
               onChange={(e) => set("meaning", e.currentTarget.value)}
             />
+          )}
+          {models.length > 0 && (
+            <FileButton accept="image/*" onChange={(f) => f && findLike(f)}>
+              {(props) => (
+                <Button {...props} size="md" variant="default" title="Pictures that look like one of yours · or paste or drop an image anywhere here">
+                  By image
+                </Button>
+              )}
+            </FileButton>
           )}
         </Group>
         <Group gap="xs" mt="xs">
@@ -487,7 +556,7 @@ function App() {
             ]}
             value={orderOf(filters)}
             onChange={(v) => set("order", v ?? "")}
-            title={filters.meaning || filters.similar ? "By date = the most similar pictures, ordered by date" : undefined}
+            title={filters.meaning || filters.similar || filters.like ? "By date = the most similar pictures, ordered by date" : undefined}
           />
           <Checkbox size="xs" label="Exact" checked={filters.exact} onChange={(e) => set("exact", e.currentTarget.checked)} />
 
@@ -503,7 +572,7 @@ function App() {
               onChange={(v) => set("min_score", v)}
             />
           )}
-          {models.length > 1 && (filters.meaning || filters.similar) && (
+          {models.length > 1 && (filters.meaning || filters.similar || filters.like) && (
             <Select
               size="xs"
               allowDeselect={false}
@@ -530,6 +599,15 @@ function App() {
                 : `picture #${filters.similar}`}
             </Text>
             <CloseButton size="sm" aria-label="Clear" onClick={() => close("similar")} />
+          </Group>
+        )}
+        {filters.like && (
+          <Group gap="xs" mt="xs">
+            <Anchor href={`/queries/${filters.like}.jpg`} target="_blank" rel="noreferrer">
+              <Image src={`/queries/${filters.like}.jpg`} fallbackSrc={NO_IMAGE} w={40} h={40} fit="cover" radius="sm" />
+            </Anchor>
+            <Text size="sm">Similar to your picture</Text>
+            <CloseButton size="sm" aria-label="Clear" onClick={() => close("like")} />
           </Group>
         )}
         {/* status line: in the sticky header so the spinner shows wherever the page is scrolled; results stay usable */}

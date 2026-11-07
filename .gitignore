@@ -3,9 +3,10 @@
 *.session
 *.session-journal
 
-# personal data: the index (incl. -wal/-shm and .bak-* backups) and downloaded photos
+# personal data: the index (incl. -wal/-shm and .bak-* backups), downloaded photos, pictures uploaded to search by
 media.db*
 media/
+queries/
 
 # not created by tgsearch (an HTTP cache that appeared in this folder)
 cache.sqlite

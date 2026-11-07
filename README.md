@@ -19,6 +19,7 @@ uv run tgsearch.py search "пароль от wifi" --from вася --chat раб
 uv run tgsearch.py search --meaning "собака в снегу"   # by what's in the picture (embeddings)
 uv run tgsearch.py search "кот" --meaning "мем"         # combined: text filters, meaning ranks
 uv run tgsearch.py search --similar 5718 --tags      # look-alikes of picture #5718 (ids shown as #N), with tags
+uv run tgsearch.py search --similar ~/Downloads/meme.png  # look-alikes of any image file, indexed or not
 uv run tgsearch.py search --msg 659070               # by exact message id (shown as "msg N" in results)
 uv run tgsearch.py search --album 568363             # all photos of the album that message belongs to
 uv run tgsearch.py search "пароль" --sort relevance  # new (default) / old / relevance
@@ -48,6 +49,7 @@ take `YYYY-MM-DD`; `-n` limit (default 20); `--open` opens hits in Preview. Each
 | `web/` | frontend: React + Vite + TS + Mantine, bun-managed; `main.tsx` is the whole app |
 | `web/dist/` | built frontend, served by `serve` (rebuild: `cd web && bun run build`) |
 | `media.db` (+ `-wal`, `-shm`) | WAL-mode SQLite: keep the three together, never copy `media.db` alone. The index: `images` (one per picture, its file), `media` (FTS5, one row per appearance: source, chat/msg ids, url, texts), `emb`; schema version in `PRAGMA user_version` |
+| `queries/<id>.jpg` | pictures uploaded in the web UI to search by (id = hash of the file, so the search URL keeps working); delete any time, those URLs then ask to upload again |
 | `media.db.bak-*` | backups taken before migrations (`-pre-dedup`, `-pre-repair` 2026-10-08, `-v0` 2026-10-14); delete when happy |
 | `media/<chat_id>/<msg_id>.<ext>` | downloaded photos and image files (paths stored relative to the folder, so it can move) (kept: re-OCR/viewing without re-downloading); VK's: `media/<VK chat id>/<owner>_<photo id>.<ext>` |
 | `tgsearch.session` | **Telethon login = full account access. Never share/commit.** |
@@ -139,6 +141,10 @@ take `YYYY-MM-DD`; `-n` limit (default 20); `--open` opens hits in Preview. Each
 - **"Similar"** = a meaning query that is the picture's own stored vector instead of a text's: pictures
   whose vectors are closest (same subject/layout/style to the model, not pixel matching — that's dedup).
   Clicking it clears the Text/Meaning boxes; whatever is typed afterwards combines with it.
+  **Any picture works too**, indexed or not: CLI `--similar FILE`; web UI "By image" button, or paste (a
+  screenshot, "Copy image", a file copied in Finder) or drop an image anywhere on the page. Its vector is made on
+  the fly (`image_vector()`, upright via EXIF, cached per file); the rest is the same. A cropped, shrunk,
+  re-compressed copy of an indexed meme still ranks its original first (0.72 vs 0.60 for the next one).
 - **Combined search**: every criterion given applies (`search()` / `rank()`). Text queries (picture text, message
   text, or either = the better of the two fields; exact or fuzzy) decide *what matches*; Meaning and/or Similar decide *relevance* when given. Meaning +
   Similar together: each similarity is z-scored over the candidates and summed (look-alike similarities run
@@ -146,15 +152,19 @@ take `YYYY-MM-DD`; `-n` limit (default 20); `--open` opens hits in Preview. Each
   drop out as soon as a picture query is given. Exact text alone stays all-SQL (FTS rank + `snippet()`).
 - **Web UI** (`serve`): FastAPI inside `tgsearch.py` reuses `search_page()` as is. `GET /api/search` (CLI's params:
   `q, ocr, caption, meaning, similar, sender, chat, after, before, msg, album, exact, min_score, order, model`, plus
-  `page` + `limit`, `chat_id` = comma-separated ids, `source` = comma-separated sources) → `{total, hits}`, each hit
+  `page` + `limit`, `chat_id` = comma-separated ids, `source` = comma-separated sources, `like` = an uploaded
+  picture's id) → `{total, hits}`, each hit
   with its `source` and file `size` (null = missing on disk); `GET /api/chats` (names, source, counts and bytes in `media/<chat_id>/` for the multi-select chat
-  filter; their sum is the "on disk" total), `/media` and `/` are static mounts (`media/`, `web/dist/`).
+  filter; their sum is the "on disk" total); `POST /api/query-image` (body = the image file as is, no multipart dependency)
+  stores it as `queries/<id>.jpg` (`save_query()`: upright, ≤ 1024 px) → `{id}`; `/media`, `/queries` and `/` are
+  static mounts (`media/`, `queries/`, `web/dist/`). Failed calls show FastAPI's `detail` in the UI.
   Frontend searches as you type (250 ms debounce, stale requests aborted; the spinner sits in the sticky status
   line, results stay usable meanwhile). **Pages** of 60: every page is a slice of one ranking (for
   Meaning/Similar sorted by date: page n = the n-th 60 best, by date), total from the same pass. **URL = search
   state**: non-default filters + page are the query string (shareable, survive reload; the same string is the API
   query); a page change is a history step (Back = previous page), typing replaces the entry. After a reload the
-  Similar banner only knows the id ("picture #N"); the album banner is derived from the results. Matches highlighted by
+  Similar banner only knows the id ("picture #N"), an uploaded picture's banner shows its thumbnail
+  (`/queries/<id>.jpg`); the album banner is derived from the results. Matches highlighted by
   splitting the snippet on the CLI's ANSI bold codes (no HTML injection). Each hit: highlighted snippet, then
   caption + full OCR text behind "Show full text" (Mantine `Spoiler`, the query marked the way search matches:
   ignoring case and accents, `fold()` in `main.tsx` mirrors the server's); without a query
@@ -263,6 +273,11 @@ take `YYYY-MM-DD`; `-n` limit (default 20); `--open` opens hits in Preview. Each
   `remove_diacritics`) and fuzzy (`fold()`, also ł ø đ); the web UI's full-text highlight too. Upgrade tried
   on a copy of the real index: ~10 s, "stad" now finds "Stąd żydy wyszli" both ways, fuzzy "zostal" finds
   "ZOSTAŁ"; fuzzy search 0.23 → 0.32 s. Fixed: fuzzy snippets had "…" on both ends even at the text's start/end.
+- **2026-10-29**: Look-alikes of any picture, not just indexed ones: CLI `--similar FILE`, web UI "By image"
+  button / paste / drop (`POST /api/query-image` → `?like=<id>`, kept in `queries/`). Verified on the real index
+  (23.3k vectors): the original file ranks itself first (0.997, re-saved as JPEG), a cropped + shrunk +
+  re-compressed copy finds its original first (0.72 vs 0.60); repeat searches 0.7 s (vector cached). In a
+  browser: button, paste, drop overlay, Back, close; plain-text paste untouched.
 - **2026-10-10**: Default sort = best match when searching (Newest when just browsing); an explicit choice wins.
 - **2026-10-10**: Fixed: UI crashed when two indexed chats share a name (group → supergroup upgrade); chat
   filter now by id. Initial git commit.

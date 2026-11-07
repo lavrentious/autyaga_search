@@ -12,6 +12,7 @@
   uv run tgsearch.py sync                  # same for every chat already indexed
   uv run tgsearch.py search "пароль" --from Вася --after 2024-01-01 --open
   uv run tgsearch.py search --meaning "собака в снегу"   # by what's in the picture (embeddings)
+  uv run tgsearch.py search --similar ~/Downloads/meme.png   # look-alikes of any image file (or of an indexed #id)
   uv run tgsearch.py embed [--model HF_ID]   # vectors for downloaded photos still missing them (sync does this too)
   uv run tgsearch.py dedup                 # merge copies of the same picture already indexed (sync does this for new ones)
   uv run tgsearch.py repair [<id|name>...] # mark messages deleted in Telegram, update captions, re-download lost files
@@ -21,7 +22,9 @@
 import argparse
 import asyncio
 import functools
+import hashlib
 import html
+import io
 import json
 import mimetypes
 import os
@@ -234,8 +237,8 @@ def search_page(db, text=None, caption=None, sender=None, chat=None, after=None,
                 offset=0, chat_ids=None, sources=None):
     """(rows `offset`..`offset + limit`, total pictures matching). One row per picture; every given criterion applies. Text queries decide what matches: `ocr` in the
     picture's text, `caption` in the message's, `text` in either; fuzzy (typos, OCR errors) if min_score is
-    set, else exact substring. `meaning` (a description) and `similar` (an image id) score what's in the
-    picture via `model`'s embeddings and decide relevance when given.
+    set, else exact substring. `meaning` (a description) and `similar` (an image id, or an image file's path)
+    score what's in the picture via `model`'s embeddings and decide relevance when given.
     order: "new"/"old" = by message date (a picture sent several times counts by its newest/oldest matching
     appearance; with meaning/similar, which match everything a bit, it's the `limit` best, sorted by date),
     "relevance" = best match first. album=(chat_id or None, msg_id): only the photos of that message's album,
@@ -293,7 +296,8 @@ def rank(db, where, params, said, min_score, model, meaning, similar, limit, off
     import numpy as np
     from rapidfuzz import fuzz, process
 
-    queries = [f"similarity to #{similar}"] * bool(similar) + ["meaning similarity"] * bool(meaning)
+    picture = f"#{similar}" if isinstance(similar, int) else Path(similar or "").name
+    queries = [f"similarity to {picture}"] * bool(similar) + ["meaning similarity"] * bool(meaning)
     rows = db.execute(f"SELECT {COLS}{', vec' if queries else ''} FROM media JOIN images ON images.id = media.image"
                       f"{' JOIN emb ON emb.image = media.image' if queries else ''}{where}", params).fetchall()
     if not rows:
@@ -317,11 +321,13 @@ def rank(db, where, params, said, min_score, model, meaning, similar, limit, off
         shown.append((q, cols, docs, scores))
     if queries:  # ponytail: brute-force cosine over every vector passing the filters (ms for 10k); faiss near ~1M
         vecs = []
-        if similar:
+        if isinstance(similar, int):
             row = db.execute("SELECT vec FROM emb WHERE model = ? AND image = ?", (model, similar)).fetchone()
             if not row:
                 return [], 0
             vecs.append(np.frombuffer(row[0], np.float16))
+        elif similar:  # an image file, not indexed
+            vecs.append(image_vector(model, str(similar)))
         if meaning:
             vecs.append(encode(model, text=meaning)[0])
         lib = np.frombuffer(b"".join(r[-1] for r in rows), np.float16).reshape(len(rows), -1)
@@ -375,6 +381,34 @@ def encode(name, images=None, text=None):
                                                   max_length=64, return_tensors="pt").to(dev))
         out = getattr(out, "pooler_output", out)  # transformers 5 returns a model output, 4.x a tensor
         return torch.nn.functional.normalize(out.float(), dim=-1).cpu().numpy().astype("float16")
+
+
+@functools.lru_cache(32)
+def image_vector(model, path):
+    """The vector of a picture that isn't indexed (an image file to find look-alikes of), upright as it's shown.
+    Cached: the web UI asks again on every keystroke and page of that search."""
+    from PIL import ImageOps
+
+    return encode(model, images=[ImageOps.exif_transpose(open_image(path)).convert("RGB")])[0]
+
+
+def save_query(data):
+    """Keep an uploaded picture to search by (web UI) as queries/<id>.jpg -> id, a hash of its bytes: the same
+    picture gets the same id, and the search's URL keeps working. Upright, at most 1024 px (the model sees 256);
+    ValueError if it's not an image."""
+    from PIL import ImageOps
+
+    qid = hashlib.sha256(data).hexdigest()[:16]
+    path = HERE / "queries" / f"{qid}.jpg"
+    if not path.exists():
+        try:
+            img = ImageOps.exif_transpose(open_image(io.BytesIO(data))).convert("RGB")
+        except OSError as e:  # not an image (Pillow's UnidentifiedImageError), truncated, a decompression bomb
+            raise ValueError(e) from None
+        img.thumbnail((1024, 1024))
+        path.parent.mkdir(exist_ok=True)
+        img.save(path, "JPEG", quality=90)
+    return qid
 
 
 TAG_SPACES = {}  # model -> (labels, label vectors, offset), built on first use
@@ -1051,10 +1085,8 @@ def disk_usage():
 def serve(port):
     from typing import Literal
 
-    import io
-
     import uvicorn
-    from fastapi import FastAPI, HTTPException, Response
+    from fastapi import FastAPI, HTTPException, Request, Response
     from fastapi.staticfiles import StaticFiles
     from starlette.concurrency import run_in_threadpool
 
@@ -1064,9 +1096,16 @@ def serve(port):
     def api_search(q: str = "", ocr: str = "", caption: str = "", sender: str = "", chat: str = "", after: str = "",
                    before: str = "", exact: bool = False, min_score: int = 80, limit: int = 60,
                    meaning: str = "", model: str = MODEL, similar: int = 0, msg: int = 0,
-                   order: Literal[ORDERS] = "new", album: str = "", page: int = 1, chat_id: str = "", source: str = ""):
+                   order: Literal[ORDERS] = "new", album: str = "", page: int = 1, chat_id: str = "", source: str = "",
+                   like: str = ""):  # like: id of an uploaded picture (POST /api/query-image) to find look-alikes of
         db = connect()
         limit = min(limit, 1000)
+        if like:
+            if not re.fullmatch(r"[0-9a-f]{16}", like):
+                raise HTTPException(400, "bad picture id")
+            if not (path := HERE / "queries" / f"{like}.jpg").exists():
+                raise HTTPException(404, "the uploaded picture is gone (queries/ was cleared): upload it again")
+            similar = str(path)
         rows, total = search_page(db, q or None, caption or None, sender or None, chat or None, after or None,
                                   before or None, limit, None if exact else min_score, model, similar or None,
                                   msg or None, order, tuple(int(x) for x in album.split(":")) if album else None,
@@ -1083,6 +1122,16 @@ def serve(port):
              "appearances": [dict(zip(("date", "chat", "sender", "link", "msg_id"), a), deleted=bool(a[5]))
                              for a in seen[img]]}
             for date, chat, sender, path, url, ocr, cap, cid, mid, img, src, gone, snip in rows]}
+
+    @app.post("/api/query-image")
+    async def api_query_image(request: Request):  # body: the image file as is -> {"id": …} for /api/search?like=
+        data = await request.body()
+        if len(data) > 100_000_000:
+            raise HTTPException(413, "over 100 MB")
+        try:
+            return {"id": await run_in_threadpool(save_query, data)}
+        except ValueError:
+            raise HTTPException(400, "not an image (or one this can't read)") from None
 
     @app.get("/api/tags")
     def api_tags(images: str, model: str = MODEL):  # separate call so text search never waits for the model
@@ -1118,9 +1167,19 @@ def serve(port):
             return Response(await run_in_threadpool(jpeg), media_type="image/jpeg")  # ~0.5 s for 12 MP
 
     app.mount("/media", Media(directory=HERE / "media", check_dir=False))
+    app.mount("/queries", StaticFiles(directory=HERE / "queries", check_dir=False))  # uploaded pictures to search by
     app.mount("/", StaticFiles(directory=HERE / "web" / "dist", html=True, check_dir=False))
     # ponytail: no auth, so localhost only; add auth before binding to anything else
     uvicorn.run(app, host="127.0.0.1", port=port)
+
+
+def picture(arg):
+    """--similar: an indexed picture's id, or an image file."""
+    if arg.isdigit():
+        return int(arg)
+    if not Path(arg).is_file():
+        raise argparse.ArgumentTypeError(f"no such file: {arg}")
+    return str(Path(arg).resolve())
 
 
 def main():
@@ -1147,7 +1206,8 @@ def main():
     s.add_argument("--meaning", metavar="DESCRIPTION", help="what's in the picture, e.g. 'dog in snow' (embeddings); "
                    "combines with TEXT (which then filters) and --similar")
     s.add_argument("--model", default=MODEL, help=f"embedding model for --meaning/--similar/--tags (default {MODEL})")
-    s.add_argument("--similar", type=int, metavar="ID", help="pictures that look like picture #ID (ids are shown in results)")
+    s.add_argument("--similar", type=picture, metavar="ID|FILE", help="pictures that look like picture #ID (ids are shown "
+                   "in results) or like an image file, indexed or not (a file named just digits: ./123)")
     s.add_argument("--tags", action="store_true", help="show what the model sees in each picture (loads the model)")
     s.add_argument("--msg", type=int, metavar="ID", help="message id (unique among private chats/small groups; "
                                                           "per chat in channels/supergroups, add --chat)")
